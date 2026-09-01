@@ -29,9 +29,10 @@ for an Obsidian vault::
     export_from_config('elog.yaml', 89, 'elog_export')   # writes elog_export/0089.md
 
 `Logbook.read` returns ``(message, attributes, attachments)``; those become the note
-body (HTML converted with markdownify), the frontmatter, and -- for now -- a plain list
-of server URLs. Downloading attachments is not implemented: see ``AttachmentHandler``
-for the seam that adds it without changing any signature above it.
+body (HTML converted with markdownify), the YAML frontmatter, and files downloaded into
+``<out_dir>/attachments/`` and linked as Obsidian wikilinks -- images embedded with
+``![[name]]``, everything else linked with ``[[name]]``. Pass
+``attachments=AttachmentHandler()`` to skip downloading and keep the remote URLs.
 
 The reverse direction, Markdown -> ELOG, is still reserved; see ``MarkdownConverter``
 and ``ConvertedMessage`` at the bottom.
@@ -64,6 +65,7 @@ __all__ = [
     'dump_frontmatter',
     'MarkdownDocument',
     'AttachmentHandler',
+    'DownloadingAttachmentHandler',
     'MarkdownExporter',
     'BatchResult',
     'export_to_markdown_file',
@@ -828,31 +830,17 @@ class MarkdownDocument:
 
 
 class AttachmentHandler:
-    """Decides what happens to an entry's attachments. Link-only stub.
+    """Decides what happens to an entry's attachments. Link-only: downloads nothing.
 
-    The default implementation performs no I/O: it records the server URLs in the
-    frontmatter and leaves the body alone. That keeps the export offline-safe and
-    preserves the join key between the two -- the timestamped filename in an
-    ``![](260828_172838_plot.png)`` link is exactly ``os.path.basename()`` of the
-    corresponding URL, so a downloading subclass can rewrite the links
-    deterministically.
+    This base class performs no I/O -- it records the server URLs in the frontmatter and
+    leaves the body alone. :class:`DownloadingAttachmentHandler` is what the exporter
+    uses by default; pass ``AttachmentHandler()`` explicitly to opt out of downloading,
+    which keeps an export entirely free of extra requests::
 
-    To add downloading later, subclass and override ``process``. Nothing above this
-    class changes signature::
+        MarkdownExporter(logbook, attachments=AttachmentHandler())
 
-        class DownloadingAttachmentHandler(AttachmentHandler):
-            def process(self, body, attachments, out_dir=None, stem=None, logbook=None):
-                target = Path(out_dir) / 'attachments'
-                target.mkdir(parents=True, exist_ok=True)
-                values = []
-                for url in attachments:
-                    timestamped = os.path.basename(url)
-                    name = timestamped[14:] or timestamped  # strip '<YYMMDD>_<HHMMSS>_'
-                    (target / name).write_bytes(logbook.download_attachment(url))
-                    body = body.replace('({0})'.format(timestamped),
-                                        '(attachments/{0})'.format(name))
-                    values.append('attachments/{0}'.format(name))
-                return body, values
+    Subclass and override ``process`` for other policies. Every parameter a handler
+    could need is already in the signature, so nothing above this class changes.
     """
 
     def process(self, body, attachments, out_dir=None, stem=None, logbook=None):
@@ -869,6 +857,122 @@ class AttachmentHandler:
         :param logbook: the ``Logbook``, for ``download_attachment``
         """
         return body, list(attachments)
+
+
+#: Extensions Obsidian renders inline with '![[...]]'. Everything else gets a plain
+#: '[[...]]' link, so a PDF or a movie does not try to render as a giant embed.
+_EMBEDDABLE_SUFFIXES = frozenset(
+    ('.png', '.jpg', '.jpeg', '.gif', '.bmp', '.svg', '.webp', '.avif', '.tif', '.tiff'))
+
+
+def _attachment_name(url):
+    """The filename ELOG stored an attachment under, e.g. '260828_193233_plot.JPG'.
+
+    Kept verbatim rather than stripping the leading '<YYMMDD>_<HHMMSS>_': that prefix
+    is what makes the name unique, and Obsidian resolves wikilinks by filename across
+    the whole vault, so two entries both attaching a 'Screen.png' would otherwise
+    collide into one file and an ambiguous link.
+    """
+    return url.rstrip('/').rsplit('/', 1)[-1]
+
+
+def _is_embeddable(name):
+    """True when Obsidian should render this file inline."""
+    return any(name.lower().endswith(suffix) for suffix in _EMBEDDABLE_SUFFIXES)
+
+
+class DownloadingAttachmentHandler(AttachmentHandler):
+    """Downloads attachments beside the note and links them as Obsidian wikilinks.
+
+    Files land in ``<out_dir>/<subdir>/`` under their server filename. Images are
+    embedded with ``![[name]]``, everything else is linked with ``[[name]]``.
+
+    Most ELOG entries never reference their attachments in the body -- the files are
+    simply attached -- so the links are appended as an ``## Attachments`` section. An
+    attachment that *is* referenced inline is rewritten in place instead, and then left
+    out of that section to avoid showing the same image twice.
+    """
+
+    def __init__(self, subdir='attachments', skip_existing=True, heading='## Attachments'):
+        """
+        :param subdir: directory under ``out_dir`` to download into
+        :param skip_existing: do not re-download a file that is already present. Safe
+                              by default because ELOG's timestamped filenames are
+                              effectively immutable, and it makes re-runs much cheaper.
+        :param heading: the appended section heading; None appends the links bare
+        """
+        self.subdir = subdir
+        self.skip_existing = skip_existing
+        self.heading = heading
+
+    def process(self, body, attachments, out_dir=None, stem=None, logbook=None):
+        if not attachments:
+            return body, []
+        if out_dir is None:
+            # to_markdown() without a directory: there is nowhere to put the files, so
+            # behave like the stub rather than silently dropping them.
+            warnings.warn('No output directory given; attachments were not downloaded.',
+                          stacklevel=2)
+            return body, list(attachments)
+
+        target_dir = Path(out_dir) / self.subdir
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        values = []
+        downloaded = []
+        for url in attachments:
+            name = _attachment_name(url)
+            destination = target_dir / name
+            if not (self.skip_existing and destination.exists()):
+                try:
+                    destination.write_bytes(logbook.download_attachment(url))
+                except (LogbookError, OSError) as e:
+                    # One unreachable file must not cost the whole note; keep the URL
+                    # so the entry still records what was attached.
+                    warnings.warn('Could not download attachment {0}: {1}'.format(url, e),
+                                  stacklevel=2)
+                    values.append(url)
+                    continue
+            values.append('{0}/{1}'.format(self.subdir, name))
+            downloaded.append(name)
+
+        body, inlined = self._rewrite_inline_links(body, downloaded)
+        body = self._append_section(body, [n for n in downloaded if n not in inlined])
+        return body, values
+
+    @staticmethod
+    def _rewrite_inline_links(body, names):
+        """Point any existing reference to a downloaded file at the local copy.
+
+        Returns ``(body, names_that_were_rewritten)``.
+        """
+        inlined = set()
+        for name in names:
+            quoted = re.escape(name)
+            link = '![[{0}]]'.format(name) if _is_embeddable(name) else '[[{0}]]'.format(name)
+
+            # ELOG's own inline image markup is a thumbnail wrapped in a link to the
+            # full attachment: [![](250912_115209/blob.png.png?thumb=1)](250912_115209_blob.png)
+            patterns = (r'\[!\[[^\]]*\]\([^)]*\)\]\(' + quoted + r'\)',
+                        r'!\[[^\]]*\]\(' + quoted + r'\)',
+                        r'\[[^\]]*\]\(' + quoted + r'\)')
+            for pattern in patterns:
+                body, count = re.subn(pattern, link.replace('\\', r'\\'), body)
+                if count:
+                    inlined.add(name)
+        return body, inlined
+
+    def _append_section(self, body, names):
+        """Append the wikilinks for attachments the body never mentions."""
+        if not names:
+            return body
+        links = ['![[{0}]]'.format(n) if _is_embeddable(n) else '[[{0}]]'.format(n)
+                 for n in names]
+        parts = [body.rstrip('\n')] if body.strip() else []
+        if self.heading:
+            parts.append(self.heading)
+        parts.append('\n'.join(links))
+        return '\n\n'.join(parts)
 
 
 def _stem(msg_id):
@@ -921,12 +1025,17 @@ class MarkdownExporter:
         """
         :param logbook: an ``elog.logbook.Logbook``, or anything with ``read`` and
                         ``download_attachment``
-        :param attachments: an :class:`AttachmentHandler`; the link-only stub by default
+        :param attachments: an :class:`AttachmentHandler`. Defaults to
+                            :class:`DownloadingAttachmentHandler`, which fetches the
+                            files into ``<out_dir>/attachments/`` and embeds images as
+                            wikilinks. Pass ``AttachmentHandler()`` for the link-only
+                            behaviour that downloads nothing.
         :param repair_encoding: undo latin-1/UTF-8 mojibake, see :func:`_repair_mojibake`
         :param timeout: request timeout in seconds, passed to ``Logbook.read``
         """
         self.logbook = logbook
-        self.attachments = attachments if attachments is not None else AttachmentHandler()
+        self.attachments = (attachments if attachments is not None
+                            else DownloadingAttachmentHandler())
         self.repair_encoding = repair_encoding
         self.timeout = timeout
 

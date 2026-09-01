@@ -88,7 +88,7 @@ The three parts of `logbook.read(89)` map onto the note as follows:
 | --- | --- |
 | `attributes` | YAML frontmatter — `Type` becomes an Obsidian `tags` list, `Date` an ISO 8601 timestamp, `$@MID@$` an integer `id`. Attributes the library does not know are kept under a slugified key rather than dropped. |
 | `message` | the note body — HTML is converted with [markdownify](https://pypi.org/project/markdownify/), ELCode gets a best-effort conversion, plain text passes through. The `Encoding` attribute selects the branch; when it is missing the content is sniffed. |
-| `attachments` | **currently a stub** — the server URLs are listed in the frontmatter but nothing is downloaded. See `AttachmentHandler` for the seam that adds downloading. |
+| `attachments` | by default the server URLs are listed in the frontmatter and nothing is downloaded; pass a `DownloadingAttachmentHandler` to fetch them (below). |
 
 The filename is the message ID zero-padded to four digits, so notes sort correctly.
 
@@ -111,6 +111,83 @@ Ran the **laser** in reflection mode.
 
 ![](260828_172838_plot.png)
 ```
+
+### Attachments
+
+Attachments are downloaded by default, into an `attachments/` folder beside the notes,
+and linked as Obsidian wikilinks. This applies to single and batch exports alike:
+
+```python
+MarkdownExporter(logbook).to_markdown_file(89, 'elog_export')
+MarkdownExporter(logbook).export_all('elog_export')
+```
+
+```
+elog_export/
+  0089.md
+  attachments/260828_193233_Laser_OnVGroove.JPG
+  attachments/260828_193337_20260828_Laser_ZeroFinding.pdf
+```
+
+```markdown
+attachments:
+  - attachments/260828_193233_Laser_OnVGroove.JPG
+  - attachments/260828_193337_20260828_Laser_ZeroFinding.pdf
+---
+
+# Prologue
+
+Tested the laser in **reflection mode**.
+
+## Attachments
+
+![[260828_193233_Laser_OnVGroove.JPG]]
+[[260828_193337_20260828_Laser_ZeroFinding.pdf]]
+```
+
+- **The server filename is kept verbatim**, timestamp prefix and all. That prefix is
+  what makes the name unique — Obsidian resolves wikilinks by filename across the whole
+  vault, so two entries each attaching a `Screen.png` would otherwise collide into one
+  file and an ambiguous link.
+- **Images are embedded** with `![[name]]`; PDFs, CSVs and anything else get a plain
+  `[[name]]` link so they do not render as a giant inline preview.
+- **Most entries never reference their attachments in the body** — the files are simply
+  attached — so the links are appended as an `## Attachments` section. An attachment
+  that *is* referenced inline (including ELOG's linked-thumbnail markup) is rewritten in
+  place instead and left out of that section.
+- **Already-downloaded files are skipped** on a re-run, since ELOG's timestamped names
+  are effectively immutable. Pass `skip_existing=False` to force a re-fetch.
+- A file that cannot be downloaded leaves its URL in the frontmatter and warns; the rest
+  of the note is still written.
+
+To turn downloading **off** and keep only the remote URLs in the frontmatter, pass the
+link-only base handler:
+
+```python
+from elog.logbook_md import AttachmentHandler
+
+MarkdownExporter(logbook, attachments=AttachmentHandler())   # no downloads at all
+```
+
+To tune it, pass a configured handler:
+
+```python
+from elog.logbook_md import DownloadingAttachmentHandler
+
+MarkdownExporter(logbook, attachments=DownloadingAttachmentHandler(
+    subdir='assets', skip_existing=False, heading='## Files'))
+```
+
+The same applies from a config file, which prompts once and exports everything:
+
+```python
+export_all_from_config('elog.yaml', 'elog_export', progress=print_progress)
+```
+
+__Note:__ a first full export downloads every attachment in the logbook, so expect it to
+take noticeably longer and use disk than a metadata-only run. Later runs re-download
+nothing, because the timestamped filenames are stable and already-present files are
+skipped.
 
 ## Export the Whole Logbook
 

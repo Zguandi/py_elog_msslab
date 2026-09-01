@@ -11,10 +11,11 @@ from pathlib import Path
 from unittest import mock
 
 import elog.logbook
-from elog.logbook_exceptions import LogbookInvalidMessageID
+from elog.logbook_exceptions import LogbookInvalidMessageID, LogbookServerProblem
 from elog.logbook_md import (
     AttachmentHandler,
     BatchResult,
+    DownloadingAttachmentHandler,
     LogbookConfig,
     LogbookExportError,
     LogbookSession,
@@ -377,7 +378,9 @@ class TestMarkdownExporter(unittest.TestCase):
     def test_end_to_end_document(self):
         logbook = _FakeLogbook(message='<p>Ran the <b>laser</b>.</p>',
                                attachments=EXAMPLE_ATTACHMENTS)
-        document = MarkdownExporter(logbook).to_markdown(89)
+        # Link-only handler: this test is about conversion, not downloading.
+        document = MarkdownExporter(
+            logbook, attachments=AttachmentHandler()).to_markdown(89)
         self.assertEqual(document.body, 'Ran the **laser**.')
         self.assertEqual(document.frontmatter['id'], 89)
         self.assertEqual(document.frontmatter['tags'], ['Hardware', 'Calibration'])
@@ -440,7 +443,8 @@ class TestAttachmentStub(unittest.TestCase):
     def test_urls_land_in_frontmatter_and_nothing_downloads(self):
         logbook = _FakeLogbook(message='<img src="260828_172838_plot.png">',
                                attachments=EXAMPLE_ATTACHMENTS)
-        document = MarkdownExporter(logbook).to_markdown(89)
+        document = MarkdownExporter(
+            logbook, attachments=AttachmentHandler()).to_markdown(89)
         self.assertEqual(document.frontmatter['attachments'], EXAMPLE_ATTACHMENTS)
         # The body keeps the raw server filename: the join key for a future downloader.
         self.assertEqual(document.body, '![](260828_172838_plot.png)')
@@ -460,8 +464,219 @@ class TestAttachmentStub(unittest.TestCase):
         self.assertIs(seen['logbook'], logbook)
 
 
-class _BatchLogbook(_FakeLogbook):
-    """A fake holding several entries, some of which fail to read."""
+class _DownloadingLogbook(_FakeLogbook):
+    """A fake that serves attachment bytes and records what was fetched."""
+
+    def __init__(self, message='<p>body</p>', attachments=(), broken_urls=()):
+        super().__init__(message=message, attachments=attachments)
+        self.broken_urls = set(broken_urls)
+        self.downloaded = []
+
+    def download_attachment(self, url, timeout=None):
+        self.downloaded.append(url)
+        if url in self.broken_urls:
+            raise LogbookServerProblem('cannot fetch {0}'.format(url))
+        return b'bytes-of-' + url.encode('ascii')
+
+
+BASE = 'https://elog.physik.uzh.ch:8080/Positioners/'
+JPG = BASE + '260828_193233_Laser_OnVGroove.JPG'
+PDF = BASE + '260828_193337_20260828_Laser_ZeroFinding.pdf'
+
+
+class TestDownloadingAttachments(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.out = Path(self._tmp.name) / 'elog_export'
+
+    def export(self, logbook, **kwargs):
+        exporter = MarkdownExporter(
+            logbook, attachments=DownloadingAttachmentHandler(**kwargs))
+        target = exporter.to_markdown_file(89, self.out)
+        return target.read_text(encoding='utf-8')
+
+    def test_files_land_in_the_attachments_folder(self):
+        self.export(_DownloadingLogbook(attachments=[JPG, PDF]))
+        self.assertEqual(
+            sorted(p.name for p in (self.out / 'attachments').iterdir()),
+            ['260828_193233_Laser_OnVGroove.JPG',
+             '260828_193337_20260828_Laser_ZeroFinding.pdf'])
+
+    def test_server_filename_is_kept_verbatim(self):
+        # The timestamp prefix is what keeps two entries' 'Screen.png' distinct.
+        self.export(_DownloadingLogbook(attachments=[BASE + '260828_1_Screen.png',
+                                                     BASE + '260901_2_Screen.png']))
+        self.assertEqual(len(list((self.out / 'attachments').iterdir())), 2)
+
+    def test_bytes_are_written(self):
+        self.export(_DownloadingLogbook(attachments=[JPG]))
+        blob = (self.out / 'attachments' / '260828_193233_Laser_OnVGroove.JPG')
+        self.assertEqual(blob.read_bytes(), b'bytes-of-' + JPG.encode('ascii'))
+
+    def test_images_are_embedded_and_others_linked(self):
+        text = self.export(_DownloadingLogbook(attachments=[JPG, PDF]))
+        self.assertIn('![[260828_193233_Laser_OnVGroove.JPG]]', text)
+        self.assertIn('[[260828_193337_20260828_Laser_ZeroFinding.pdf]]', text)
+        # The PDF must be a link, not an embed.
+        self.assertNotIn('![[260828_193337_20260828_Laser_ZeroFinding.pdf]]', text)
+
+    def test_uppercase_extensions_count_as_images(self):
+        text = self.export(_DownloadingLogbook(attachments=[JPG]))
+        self.assertIn('![[', text)
+
+    def test_attachments_section_is_appended(self):
+        text = self.export(_DownloadingLogbook(message='<p>prose</p>',
+                                               attachments=[JPG]))
+        body = text.split('\n---\n', 1)[1]
+        self.assertIn('prose', body)
+        self.assertIn('## Attachments', body)
+        self.assertLess(body.index('prose'), body.index('## Attachments'))
+
+    def test_frontmatter_holds_local_relative_paths(self):
+        text = self.export(_DownloadingLogbook(attachments=[JPG]))
+        self.assertIn('- attachments/260828_193233_Laser_OnVGroove.JPG', text)
+        self.assertNotIn(JPG, text)
+
+    def test_elog_linked_thumbnail_is_rewritten_in_place(self):
+        # The real markup from entry 0030: a thumbnail wrapped in a link to the file.
+        url = BASE + '250912_115209_blob_image.png'
+        html = ('<p>text <a href="250912_115209_blob_image.png">'
+                '<img src="250912_115209/blob_image.png.png?thumb=1"></a></p>')
+        text = self.export(_DownloadingLogbook(message=html, attachments=[url]))
+        body = text.split('\n---\n', 1)[1]
+        self.assertIn('![[250912_115209_blob_image.png]]', body)
+        self.assertNotIn('?thumb=1', body)
+        # Rewritten in place, so it must not also appear in an appended section.
+        self.assertNotIn('## Attachments', body)
+
+    def test_plain_inline_image_is_rewritten(self):
+        url = BASE + '260828_1_plot.png'
+        text = self.export(_DownloadingLogbook(
+            message='<p><img src="260828_1_plot.png"></p>', attachments=[url]))
+        body = text.split('\n---\n', 1)[1]
+        self.assertIn('![[260828_1_plot.png]]', body)
+        self.assertNotIn('](260828_1_plot.png)', body)
+
+    def test_inlined_and_unreferenced_attachments_coexist(self):
+        inline = BASE + '260828_1_plot.png'
+        text = self.export(_DownloadingLogbook(
+            message='<p><img src="260828_1_plot.png"></p>',
+            attachments=[inline, PDF]))
+        body = text.split('\n---\n', 1)[1]
+        self.assertIn('![[260828_1_plot.png]]', body)
+        self.assertIn('## Attachments', body)
+        # The inlined one is not repeated in the section.
+        self.assertEqual(body.count('260828_1_plot.png'), 1)
+
+    def test_skip_existing_avoids_redownload(self):
+        logbook = _DownloadingLogbook(attachments=[JPG])
+        self.export(logbook)
+        self.assertEqual(len(logbook.downloaded), 1)
+        self.export(logbook)
+        self.assertEqual(len(logbook.downloaded), 1)   # not fetched again
+
+    def test_skip_existing_false_refetches(self):
+        logbook = _DownloadingLogbook(attachments=[JPG])
+        self.export(logbook, skip_existing=False)
+        self.export(logbook, skip_existing=False)
+        self.assertEqual(len(logbook.downloaded), 2)
+
+    def test_failed_download_keeps_the_url_and_warns(self):
+        logbook = _DownloadingLogbook(attachments=[JPG, PDF], broken_urls=[JPG])
+        with self.assertWarns(UserWarning):
+            text = self.export(logbook)
+        # The unreachable one falls back to its URL; the other still downloads.
+        self.assertIn('- {0}'.format(JPG), text)
+        self.assertIn('- attachments/260828_193337_20260828_Laser_ZeroFinding.pdf', text)
+
+    def test_entry_without_attachments_is_unchanged(self):
+        text = self.export(_DownloadingLogbook(message='<p>prose</p>'))
+        self.assertNotIn('## Attachments', text)
+        self.assertFalse((self.out / 'attachments').exists())
+
+    def test_in_memory_export_warns_instead_of_downloading(self):
+        logbook = _DownloadingLogbook(attachments=[JPG])
+        exporter = MarkdownExporter(logbook,
+                                    attachments=DownloadingAttachmentHandler())
+        with self.assertWarns(UserWarning):
+            document = exporter.to_markdown(89)
+        self.assertEqual(document.frontmatter['attachments'], [JPG])
+        self.assertEqual(logbook.downloaded, [])
+
+    def test_custom_subdir(self):
+        self.export(_DownloadingLogbook(attachments=[JPG]), subdir='files')
+        self.assertTrue((self.out / 'files').is_dir())
+
+    def test_batch_export_downloads_for_every_entry(self):
+        logbook = _BatchLogbook(ids=[1, 2])
+        logbook.attachments = [JPG]
+        exporter = MarkdownExporter(
+            logbook, attachments=DownloadingAttachmentHandler())
+        result = exporter.export_all(self.out)
+        self.assertEqual(len(result.exported), 2)
+        self.assertTrue((self.out / 'attachments' /
+                         '260828_193233_Laser_OnVGroove.JPG').exists())
+
+
+class TestDownloadingIsTheDefault(unittest.TestCase):
+    """Attachments are downloaded and embedded unless a handler says otherwise."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.out = Path(self._tmp.name) / 'elog_export'
+
+    def test_single_export_downloads_without_being_asked(self):
+        logbook = _DownloadingLogbook(attachments=[JPG, PDF])
+        target = MarkdownExporter(logbook).to_markdown_file(89, self.out)
+        self.assertEqual(len(logbook.downloaded), 2)
+        text = target.read_text(encoding='utf-8')
+        self.assertIn('![[260828_193233_Laser_OnVGroove.JPG]]', text)
+        self.assertTrue((self.out / 'attachments' /
+                         '260828_193233_Laser_OnVGroove.JPG').exists())
+
+    def test_batch_export_downloads_without_being_asked(self):
+        logbook = _BatchLogbook(ids=[1, 2])
+        logbook.attachments = [JPG]
+        result = MarkdownExporter(logbook).export_all(self.out)
+        self.assertEqual(len(result.exported), 2)
+        self.assertTrue((self.out / 'attachments' /
+                         '260828_193233_Laser_OnVGroove.JPG').exists())
+        # Downloaded once for the first entry, then skipped for the second.
+        self.assertEqual(len(logbook.downloaded), 1)
+
+    def test_session_export_downloads_without_being_asked(self):
+        config = LogbookConfig.from_mapping({'hostname': 'https://h', 'logbook': 'D'})
+        logbook = _BatchLogbook(ids=[1])
+        logbook.attachments = [JPG]
+        with mock.patch('elog.logbook_md.Logbook', return_value=logbook):
+            session = LogbookSession(
+                config, credentials=mock.Mock(user='a', password='b'))
+            session.export_all(self.out)
+        self.assertEqual(len(logbook.downloaded), 1)
+
+    def test_explicit_stub_handler_opts_out(self):
+        logbook = _DownloadingLogbook(attachments=[JPG])
+        MarkdownExporter(logbook, attachments=AttachmentHandler()).to_markdown_file(
+            89, self.out)
+        self.assertEqual(logbook.downloaded, [])
+        self.assertFalse((self.out / 'attachments').exists())
+
+    def test_entries_without_attachments_make_no_requests(self):
+        logbook = _DownloadingLogbook(message='<p>prose</p>')
+        MarkdownExporter(logbook).to_markdown_file(89, self.out)
+        self.assertEqual(logbook.downloaded, [])
+        self.assertFalse((self.out / 'attachments').exists())
+
+
+class _BatchLogbook(_DownloadingLogbook):
+    """A fake holding several entries, some of which fail to read.
+
+    Inherits the downloading fake so batch tests can exercise attachments too; the
+    stub's "must not download" guard stays on _FakeLogbook for the stub tests.
+    """
 
     def __init__(self, ids=(1, 2, 89), broken=()):
         super().__init__()
@@ -480,7 +695,8 @@ class _BatchLogbook(_FakeLogbook):
             raise LogbookInvalidMessageID('no such entry {0}'.format(msg_id))
         attributes = dict(EXAMPLE_ATTRIBUTES)
         attributes['$@MID@$'] = str(msg_id)
-        return '<p>entry {0}</p>'.format(msg_id), attributes, []
+        return ('<p>entry {0}</p>'.format(msg_id), attributes,
+                list(self.attachments))
 
 
 class TestListMessageIds(unittest.TestCase):
@@ -674,7 +890,8 @@ class TestExportedEntryIsValidMarkdown(unittest.TestCase):
         logbook = _FakeLogbook(message='<p>Ran the <b>laser</b>.</p>',
                                attachments=EXAMPLE_ATTACHMENTS)
         with tempfile.TemporaryDirectory() as tmp:
-            target = MarkdownExporter(logbook).to_markdown_file(89, tmp)
+            target = MarkdownExporter(
+                logbook, attachments=AttachmentHandler()).to_markdown_file(89, tmp)
             text = target.read_text(encoding='utf-8')
 
         _, _, rest = text.partition('---\n')
