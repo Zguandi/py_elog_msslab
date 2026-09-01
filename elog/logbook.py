@@ -363,9 +363,17 @@ class Logbook(object):
 
         message = '\n'.join(returned_msg[delimiter_idx + 1:])
         for line in returned_msg[0:delimiter_idx]:
-            line = line.split(': ')
-            data = ''.join(line[1:])
-            if line[0] == 'Attachment':
+            # partition, not split(': '): split breaks on EVERY occurrence and the
+            # ''.join that followed dropped the separators, so a Subject of
+            # 'Re: nozzle test' came back as 'Renozzle test'.
+            key, separator, data = line.partition(': ')
+            if not separator:
+                if not line.endswith(':'):
+                    # Not a header line at all; skip rather than invent a key.
+                    continue
+                # 'Category:' -- attribute is present but has no value.
+                key, data = line[:-1], ''
+            if key == 'Attachment':
                 if not data:
                     # Treat the empty string as special case,
                     # otherwise the split below returns [""] and attachments is [self._url]
@@ -376,7 +384,7 @@ class Logbook(object):
                     # recognisable by others, and downloaded if needed
                     attachments = [self._url + '{0}'.format(i) for i in attachments]
             else:
-                attributes[line[0]] = data
+                attributes[key] = data
 
         return message, attributes, attachments
 

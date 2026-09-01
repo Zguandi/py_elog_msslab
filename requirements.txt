@@ -2,3 +2,4 @@ requests
 passlib
 lxml
 PyYAML
+markdownify>=0.13
