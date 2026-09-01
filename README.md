@@ -112,6 +112,50 @@ Ran the **laser** in reflection mode.
 ![](260828_172838_plot.png)
 ```
 
+## Export the Whole Logbook
+
+Exports every entry, prompting for credentials **once** regardless of how many entries
+there are:
+
+```python
+from elog.logbook_md import export_all_from_config, print_progress
+
+result = export_all_from_config('elog.yaml', 'elog_export', progress=print_progress)
+print(result.summary())      # '412 exported, 0 skipped, 3 failed (of 415)'
+```
+
+Or against a logbook you already hold:
+
+```python
+exporter = MarkdownExporter(logbook)
+exporter.list_message_ids()                       # every id, ascending
+exporter.export_all('elog_export')                # -> BatchResult
+exporter.export_all('elog_export', msg_ids=[1, 2, 89])
+exporter.export_all('elog_export', skip_existing=True)   # resume an interrupted run
+```
+
+IDs are discovered with `search('', n_results=1_000_000)` rather than
+`get_message_ids()`. Only `search` passes `npp` (entries per page) to the server;
+`get_message_ids()` requests `<url>page` with no page size and so returns just one
+page, which would silently truncate the batch on a large logbook. Deleted entries never
+appear in the listing, so every discovered id is valid.
+
+A failing entry is recorded and the batch continues — one unreadable entry should not
+cost you the rest. Pass `stop_on_error=True` for the strict behaviour. The returned
+`BatchResult` carries `exported` (`[(msg_id, Path)]`), `skipped`, and `failed`
+(`[(msg_id, exception)]` — the exception object, not a string), and is falsey when
+anything failed:
+
+```python
+result = exporter.export_all('elog_export')
+if not result:
+    for msg_id, error in result.failed:
+        print(msg_id, error)
+```
+
+By default every entry is re-exported so edits made on the server propagate. Use
+`skip_existing=True` to only fetch entries with no `.md` file yet.
+
 ## Get Existing Message Ids
 Get all the existing message ids of a logbook
 

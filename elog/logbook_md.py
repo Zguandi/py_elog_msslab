@@ -65,8 +65,11 @@ __all__ = [
     'MarkdownDocument',
     'AttachmentHandler',
     'MarkdownExporter',
+    'BatchResult',
     'export_to_markdown_file',
     'export_from_config',
+    'export_all_from_config',
+    'print_progress',
     'LogbookSession',
     'open_from_config',
     'ConvertedMessage',
@@ -879,6 +882,34 @@ def _stem(msg_id):
         raise LogbookExportError('Invalid ELOG message ID {0!r}.'.format(msg_id)) from e
 
 
+@dataclass
+class BatchResult:
+    """What a batch export did, entry by entry.
+
+    Returned rather than printed so a caller can act on it -- retry the failures, assert
+    in a test, or write a report. ``failed`` keeps the exception itself, not a string,
+    so nothing is lost.
+    """
+
+    exported: list = field(default_factory=list)   # [(msg_id, Path)]
+    skipped: list = field(default_factory=list)    # [msg_id] -- already on disk
+    failed: list = field(default_factory=list)     # [(msg_id, exception)]
+
+    @property
+    def total(self):
+        """How many entries were considered."""
+        return len(self.exported) + len(self.skipped) + len(self.failed)
+
+    def summary(self):
+        """A one-line human-readable tally."""
+        return '{0} exported, {1} skipped, {2} failed (of {3})'.format(
+            len(self.exported), len(self.skipped), len(self.failed), self.total)
+
+    def __bool__(self):
+        """True when nothing failed."""
+        return not self.failed
+
+
 class MarkdownExporter:
     """Turns ELOG entries into Markdown notes.
 
@@ -949,6 +980,78 @@ class MarkdownExporter:
         temp.write_text(document.to_text(), encoding='utf-8', newline='\n')
         temp.replace(target)
         return target
+
+
+    def list_message_ids(self, page_size=1000000):
+        """Return every message ID in the logbook, ascending.
+
+        Uses ``search('')`` rather than ``get_message_ids()``: search passes ``npp``
+        (entries per page) to the server, while ``get_message_ids`` requests
+        ``<url>page`` with no page size and so returns only as many entries as the
+        logbook's own "entries per page" setting allows -- silently truncating the
+        batch on a large logbook.
+
+        Deleted entries simply never appear in the listing, so every ID returned is
+        valid and no probing for gaps is needed.
+
+        :param page_size: the ``npp`` value; the default is high enough to mean
+                          "everything" for any realistic logbook
+        """
+        return sorted(self.logbook.search('', n_results=page_size,
+                                          timeout=self.timeout))
+
+    def export_all(self, out_dir, msg_ids=None, overwrite=True, skip_existing=False,
+                   stop_on_error=False, progress=None):
+        """Export many entries, one at a time, into ``out_dir``.
+
+        The credentials were already resolved when the ``Logbook`` was built, so a
+        whole batch prompts at most once regardless of size.
+
+        :param out_dir: destination directory, created if missing
+        :param msg_ids: which entries to export; every entry in the logbook by default
+        :param overwrite: replace notes that already exist (see ``skip_existing``)
+        :param skip_existing: leave entries that already have a ``.md`` file alone.
+                              Makes a re-run cheap and resumable, at the cost of not
+                              picking up edits made on the server since.
+        :param stop_on_error: re-raise the first failure instead of recording it. Off
+                              by default: one unreadable entry must not cost you the
+                              other 899.
+        :param progress: optional callable ``(done, total, msg_id, status)`` where
+                         status is 'exported', 'skipped' or 'failed'
+        :return: a :class:`BatchResult`
+        """
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        if msg_ids is None:
+            msg_ids = self.list_message_ids()
+        msg_ids = list(msg_ids)
+
+        result = BatchResult()
+        for done, msg_id in enumerate(msg_ids, start=1):
+            try:
+                target = out_dir / '{0}.md'.format(_stem(msg_id))
+                if skip_existing and target.exists():
+                    result.skipped.append(msg_id)
+                    status = 'skipped'
+                else:
+                    target = self.to_markdown_file(msg_id, out_dir, overwrite=overwrite)
+                    result.exported.append((msg_id, target))
+                    status = 'exported'
+            except (LogbookError, ValueError) as e:
+                # LogbookError covers the library's own failures; ValueError covers
+                # Logbook.read raising bare when a response carries no '=' delimiter,
+                # which is what a truncated or error page looks like.
+                if stop_on_error:
+                    raise
+                warnings.warn('Skipping ELOG entry {0}: {1}'.format(msg_id, e),
+                              stacklevel=2)
+                result.failed.append((msg_id, e))
+                status = 'failed'
+
+            if progress is not None:
+                progress(done, len(msg_ids), msg_id, status)
+        return result
 
 
 def export_to_markdown_file(logbook, msg_id, out_dir, **kwargs):
@@ -1059,6 +1162,17 @@ class LogbookSession:
         """Export one ELOG entry to ``<out_dir>/<msg_id:04d>.md``."""
         return self.exporter.to_markdown_file(msg_id, out_dir, overwrite=overwrite)
 
+    def list_message_ids(self, page_size=1000000):
+        """Return every message ID in the logbook, ascending."""
+        return self.exporter.list_message_ids(page_size=page_size)
+
+    def export_all(self, out_dir, **kwargs):
+        """Export every ELOG entry to ``out_dir``, prompting for credentials once.
+
+        See :meth:`MarkdownExporter.export_all` for the parameters.
+        """
+        return self.exporter.export_all(out_dir, **kwargs)
+
     def post_markdown(self, markdown_text, **kwargs):
         """Convert Markdown and post it. Not implemented yet.
 
@@ -1088,6 +1202,31 @@ def export_from_config(path, msg_id, out_dir, strict=True, overwrite=True, **kwa
     """
     session = LogbookSession.from_config_file(path, strict=strict, **kwargs)
     return session.to_markdown_file(msg_id, out_dir, overwrite=overwrite)
+
+
+def export_all_from_config(path, out_dir, strict=True, progress=None, **kwargs):
+    """Export every entry to Markdown from a YAML config file, prompting once::
+
+        result = export_all_from_config('elog.yaml', 'elog_export')
+        print(result.summary())
+
+    Pass ``progress=print_progress`` for a running count on the terminal.
+    """
+    session_kwargs = {k: kwargs.pop(k) for k in
+                      ('credentials', 'prompter', 'attachments', 'timeout')
+                      if k in kwargs}
+    session = LogbookSession.from_config_file(path, strict=strict, **session_kwargs)
+    return session.export_all(out_dir, progress=progress, **kwargs)
+
+
+def print_progress(done, total, msg_id, status):
+    """A ready-made ``progress`` callback that overwrites one terminal line.
+
+    Written to stderr so that piping an export's stdout somewhere stays clean.
+    """
+    end = '\n' if done == total else ''
+    print('\r  [{0}/{1}] {2} {3}    '.format(done, total, status, msg_id),
+          end=end, file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------

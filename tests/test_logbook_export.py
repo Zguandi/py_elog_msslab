@@ -11,8 +11,10 @@ from pathlib import Path
 from unittest import mock
 
 import elog.logbook
+from elog.logbook_exceptions import LogbookInvalidMessageID
 from elog.logbook_md import (
     AttachmentHandler,
+    BatchResult,
     LogbookConfig,
     LogbookExportError,
     LogbookSession,
@@ -456,6 +458,148 @@ class TestAttachmentStub(unittest.TestCase):
         self.assertEqual(document.frontmatter['attachments'], ['local/plot.png'])
         self.assertEqual(seen['stem'], '0089')
         self.assertIs(seen['logbook'], logbook)
+
+
+class _BatchLogbook(_FakeLogbook):
+    """A fake holding several entries, some of which fail to read."""
+
+    def __init__(self, ids=(1, 2, 89), broken=()):
+        super().__init__()
+        self.ids = list(ids)
+        self.broken = set(broken)
+        self.search_calls = []
+
+    def search(self, term, n_results=20, scope='subtext', timeout=None):
+        self.search_calls.append((term, n_results, timeout))
+        # ELOG lists newest first; the exporter is expected to sort.
+        return list(reversed(self.ids))
+
+    def read(self, msg_id, timeout=None):
+        self.read_calls.append((msg_id, timeout))
+        if msg_id in self.broken:
+            raise LogbookInvalidMessageID('no such entry {0}'.format(msg_id))
+        attributes = dict(EXAMPLE_ATTRIBUTES)
+        attributes['$@MID@$'] = str(msg_id)
+        return '<p>entry {0}</p>'.format(msg_id), attributes, []
+
+
+class TestListMessageIds(unittest.TestCase):
+
+    def test_uses_search_with_a_large_page_size(self):
+        # get_message_ids hits /page with no npp and would silently truncate.
+        logbook = _BatchLogbook(ids=[1, 2, 89])
+        exporter = MarkdownExporter(logbook, timeout=5)
+        self.assertEqual(exporter.list_message_ids(), [1, 2, 89])
+        term, n_results, timeout = logbook.search_calls[0]
+        self.assertEqual(term, '')
+        self.assertGreaterEqual(n_results, 1000000)
+        self.assertEqual(timeout, 5)
+
+    def test_result_is_sorted_ascending(self):
+        self.assertEqual(MarkdownExporter(_BatchLogbook(ids=[5, 1, 3])
+                                          ).list_message_ids(), [1, 3, 5])
+
+    def test_page_size_is_configurable(self):
+        logbook = _BatchLogbook()
+        MarkdownExporter(logbook).list_message_ids(page_size=50)
+        self.assertEqual(logbook.search_calls[0][1], 50)
+
+
+class TestExportAll(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.out = Path(self._tmp.name) / 'vault'
+
+    def test_exports_every_entry(self):
+        result = MarkdownExporter(_BatchLogbook(ids=[1, 2, 89])).export_all(self.out)
+        self.assertEqual(len(result.exported), 3)
+        self.assertEqual(sorted(p.name for p in self.out.glob('*.md')),
+                         ['0001.md', '0002.md', '0089.md'])
+
+    def test_discovers_ids_when_not_given(self):
+        logbook = _BatchLogbook(ids=[1, 2])
+        MarkdownExporter(logbook).export_all(self.out)
+        self.assertEqual(len(logbook.search_calls), 1)
+        self.assertEqual([call[0] for call in logbook.read_calls], [1, 2])
+
+    def test_explicit_ids_skip_discovery(self):
+        logbook = _BatchLogbook(ids=[1, 2, 89])
+        MarkdownExporter(logbook).export_all(self.out, msg_ids=[2])
+        self.assertEqual(logbook.search_calls, [])
+        self.assertEqual([call[0] for call in logbook.read_calls], [2])
+
+    def test_one_failure_does_not_stop_the_batch(self):
+        logbook = _BatchLogbook(ids=[1, 2, 89], broken=[2])
+        with self.assertWarns(UserWarning):
+            result = MarkdownExporter(logbook).export_all(self.out)
+        self.assertEqual([msg_id for msg_id, _ in result.exported], [1, 89])
+        self.assertEqual([msg_id for msg_id, _ in result.failed], [2])
+        self.assertIsInstance(result.failed[0][1], LogbookInvalidMessageID)
+
+    def test_stop_on_error_reraises(self):
+        logbook = _BatchLogbook(ids=[1, 2, 89], broken=[2])
+        self.assertRaises(LogbookInvalidMessageID,
+                          MarkdownExporter(logbook).export_all,
+                          self.out, stop_on_error=True)
+
+    def test_skip_existing(self):
+        exporter = MarkdownExporter(_BatchLogbook(ids=[1, 2]))
+        exporter.export_all(self.out)
+        logbook = _BatchLogbook(ids=[1, 2])
+        result = MarkdownExporter(logbook).export_all(self.out, skip_existing=True)
+        self.assertEqual(result.skipped, [1, 2])
+        self.assertEqual(logbook.read_calls, [])   # nothing re-read
+
+    def test_re_export_refreshes_by_default(self):
+        exporter = MarkdownExporter(_BatchLogbook(ids=[1]))
+        exporter.export_all(self.out)
+        (self.out / '0001.md').write_text('stale', encoding='utf-8')
+        exporter.export_all(self.out)
+        self.assertNotIn('stale',
+                         (self.out / '0001.md').read_text(encoding='utf-8'))
+
+    def test_progress_callback(self):
+        seen = []
+        MarkdownExporter(_BatchLogbook(ids=[1, 2])).export_all(
+            self.out, progress=lambda *a: seen.append(a))
+        self.assertEqual(seen, [(1, 2, 1, 'exported'), (2, 2, 2, 'exported')])
+
+    def test_progress_reports_failures(self):
+        seen = []
+        with self.assertWarns(UserWarning):
+            MarkdownExporter(_BatchLogbook(ids=[1], broken=[1])).export_all(
+                self.out, progress=lambda *a: seen.append(a))
+        self.assertEqual(seen, [(1, 1, 1, 'failed')])
+
+    def test_output_directory_is_created(self):
+        MarkdownExporter(_BatchLogbook(ids=[1])).export_all(self.out / 'a' / 'b')
+        self.assertTrue((self.out / 'a' / 'b' / '0001.md').exists())
+
+    def test_empty_logbook(self):
+        result = MarkdownExporter(_BatchLogbook(ids=[])).export_all(self.out)
+        self.assertEqual(result.total, 0)
+        self.assertTrue(result)
+
+    def test_single_credential_resolution(self):
+        # The Logbook is built once, so a whole batch prompts at most once.
+        logbook = _BatchLogbook(ids=[1, 2, 89])
+        exporter = MarkdownExporter(logbook)
+        exporter.export_all(self.out)
+        self.assertIs(exporter.logbook, logbook)
+
+
+class TestBatchResult(unittest.TestCase):
+
+    def test_summary_and_truthiness(self):
+        result = BatchResult(exported=[(1, 'a')], skipped=[2], failed=[(3, ValueError())])
+        self.assertEqual(result.total, 3)
+        self.assertEqual(result.summary(), '1 exported, 1 skipped, 1 failed (of 3)')
+        self.assertFalse(result)
+
+    def test_clean_result_is_truthy(self):
+        self.assertTrue(BatchResult(exported=[(1, 'a')]))
 
 
 class TestLogbookSessionExport(unittest.TestCase):
