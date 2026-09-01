@@ -95,9 +95,9 @@ The filename is the message ID zero-padded to four digits, so notes sort correct
 ```markdown
 ---
 id: 89
-date: '2026-08-28T17:28:38+02:00'
-author: Johannes
-subject: Measurement with Laser in Reflection Mode with Sanded PTFE Screen
+date: '2026-08-31T11:45:14+02:00'
+author: NotMe
+subject: Measurement of test setup Number 1919
 tags:
   - Hardware
   - Calibration
