@@ -14,12 +14,14 @@ requirements:
         - passlib
         - requests
         - lxml
+        - pyyaml
 
     run:
         - python
         - passlib
         - requests
         - lxml
+        - pyyaml
 
 about:
     home: https://github.com/paulscherrerinstitute/py_elog

@@ -1,3 +1,16 @@
+"""Live integration tests against a real, shared, public ELOG server.
+
+WARNING: these tests WRITE to https://elog.psi.ch/elogs/Linux+Demo/. They post new
+entries, post a ten-entry reply tree, and test_edit overwrites the body of whatever
+the most recent message currently is -- which may belong to somebody else.
+
+They are therefore excluded from collection by conftest.py unless opted in:
+
+    ELOG_LIVE_TESTS=1 pytest
+
+For tests that exercise the library without touching any server, see test_logbook_md.py.
+"""
+
 import unittest
 import elog
 from elog.logbook_exceptions import *

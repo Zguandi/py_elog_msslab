@@ -1,0 +1,24 @@
+# Example ELOG connection configuration.
+#
+# Copy to elog.yaml and edit. One connection per file.
+# Only "hostname" is required; every other key falls back to the default shown.
+#
+# Credentials are NOT read from this file -- they are always prompted for on the
+# terminal, so this file is safe to commit.
+
+# Required. A bare host is fine: the scheme is filled in from use_ssl below.
+hostname: https://elog.psi.ch
+
+# Name of the logbook on the server. Default: '' (the server's default logbook).
+logbook: Linux+Demo
+
+# Subdirectory the logbooks live under, i.e. <host>/<subdir>/<logbook>/.
+# Default: ''. Do not set this if hostname already contains a path.
+subdir: elogs
+
+# Server port. Default: unset, meaning 80 for http and 443 for https.
+# Do not set this if hostname already contains a port.
+# port: 8080
+
+# Connect over https. Default: true. Ignored if hostname carries an explicit scheme.
+# use_ssl: true

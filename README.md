@@ -22,6 +22,45 @@ logbook = elog.open('localhost', 'demo', port=8080, use_ssl=False)
 
 Once you have hold of the logbook handle one of its public methods can be used to read, create, reply to, edit or delete the message.
 
+## Configuration File
+
+Rather than hardcoding the connection parameters and credentials, the connection can be
+described in a YAML file and the credentials prompted for on the terminal:
+
+```yaml
+# elog.yaml
+hostname: https://elog.psi.ch   # required; a bare host is fine, the scheme is added
+logbook: Linux+Demo             # optional, default ''
+subdir: elogs                   # optional, default ''
+port: 8080                      # optional, default 80 (http) / 443 (https)
+use_ssl: true                   # optional, default true
+```
+
+```python
+from elog.logbook_md import open_from_config
+
+# Prompts for the username and password, then returns a normal Logbook
+logbook = open_from_config('elog.yaml')
+logbook.post('This is message text', author='me', type='Routine')
+```
+
+Credentials are never read from the config file, so it is safe to commit. See
+[elog.example.yaml](elog.example.yaml) for an annotated template.
+
+For more control, use the underlying pieces directly:
+
+```python
+from elog.logbook_md import load_config, CredentialPrompter, LogbookSession
+
+config = load_config('elog.yaml')            # parse + validate, no I/O beyond the read
+session = LogbookSession(config, prompter=CredentialPrompter())
+logbook = session.connect_interactive()      # verifies, re-prompting on auth failure
+```
+
+Unknown or conflicting keys are reported rather than silently ignored, and the config
+layer fills in a missing URL scheme — without it, a bare `hostname` produces the URL
+`https:///<logbook>/`, which only fails later with an opaque error.
+
 ## Get Existing Message Ids
 Get all the existing message ids of a logbook
 
@@ -108,8 +147,21 @@ logbook.delete(23)
 __Note:__ Due to the way elog implements delete this function is only supported on english logbooks.
 
 # Installation
-The Elog module and only depends on the `passlib` and `requests` library used for password encryption and http(s) communication. It is packed as [anaconda package](https://anaconda.org/paulscherrerinstitute/elog) and can be installed as follows:
+The Elog module depends on `passlib` and `requests` (password encryption and http(s) communication), `lxml` (parsing listing pages) and `PyYAML` (reading configuration files). It is packed as [anaconda package](https://anaconda.org/paulscherrerinstitute/elog) and can be installed as follows:
 
 ```bash
 conda install -c paulscherrerinstitute elog
 ```
+
+# Running the Tests
+
+```bash
+pytest                      # offline tests only (tests/test_logbook_md.py)
+ELOG_LIVE_TESTS=1 pytest    # additionally runs the live integration tests
+```
+
+__Note:__ `tests/test_logbook.py` runs against the real, shared, public logbook at
+`https://elog.psi.ch/elogs/Linux+Demo/` and **writes** to it — it posts entries and
+overwrites the body of the most recent message, which may belong to somebody else. It is
+therefore excluded from collection unless `ELOG_LIVE_TESTS=1` is set. The offline suite
+in `tests/test_logbook_md.py` never opens a socket.
