@@ -29,7 +29,7 @@ dependencies = [
 description = "Python library to access Elog."
 readme = "README.md"
 license = { file = "LICENSE.txt" }
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 classifiers = [
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",

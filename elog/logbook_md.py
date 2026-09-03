@@ -1097,10 +1097,13 @@ class MarkdownExporter:
         # filesystem, so an interrupted export cannot leave a truncated note behind in
         # a vault that something else is syncing.
         temp = target.with_suffix('.md.tmp')
-        # Path.write_text, not open(): elog.open shadows the builtin in this package.
+        # Path.open, not the bare builtin: elog.open shadows it in this package. And
+        # Path.open rather than Path.write_text because write_text only grew the
+        # newline argument in 3.10, while Path.open has always accepted it.
         # newline='\n' stops Windows from turning every '\n' into '\r\n', which would
         # make every note differ from a Linux-generated one.
-        temp.write_text(document.to_text(), encoding='utf-8', newline='\n')
+        with temp.open('w', encoding='utf-8', newline='\n') as handle:
+            handle.write(document.to_text())
         temp.replace(target)
         return target
 
