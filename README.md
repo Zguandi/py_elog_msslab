@@ -319,10 +319,54 @@ logbook.delete(23)
 __Note:__ Due to the way elog implements delete this function is only supported on english logbooks.
 
 # Installation
-The Elog module depends on `passlib` and `requests` (password encryption and http(s) communication), `lxml` (parsing listing pages) and `PyYAML` (reading configuration files). It is packed as [anaconda package](https://anaconda.org/paulscherrerinstitute/elog) and can be installed as follows:
+
+Clone the repository and install it with pip:
 
 ```bash
-conda install -c paulscherrerinstitute elog
+git clone https://github.com/Zguandi/py_elog_msslab.git
+cd py_elog_msslab
+pip install .
+```
+
+For development, install in editable mode so changes to the source take effect
+immediately:
+
+```bash
+pip install -e .
+```
+
+Python 3.10 or newer is required. Dependencies are declared in `pyproject.toml` and
+installed automatically:
+
+| Package | Used for |
+| --- | --- |
+| `requests` | http(s) communication |
+| `passlib` | password encryption |
+| `lxml` | parsing logbook listing pages |
+| `PyYAML` | reading configuration files, writing note frontmatter |
+| `markdownify` | converting HTML entries to Markdown |
+
+## Installing into another project
+
+To use this library from a project of your own, point the dependency at a local
+checkout rather than PyPI. With [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv add --editable ../path/to/py_elog_msslab
+```
+
+which records the checkout in your `pyproject.toml`:
+
+```toml
+[tool.uv.sources]
+py-elog = { path = "../path/to/py_elog_msslab", editable = true }
+```
+
+The plain-pip equivalent is `pip install -e ../path/to/py_elog_msslab`, or install
+straight from GitHub without a local clone:
+
+```bash
+pip install git+https://github.com/Zguandi/py_elog_msslab.git
 ```
 
 # Running the Tests
