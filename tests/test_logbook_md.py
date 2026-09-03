@@ -370,9 +370,12 @@ class TestLogbookSession(unittest.TestCase):
         self.assertRaises(LogbookAuthenticationError,
                           self._session().connect_interactive, attempts=2)
 
-    def test_post_markdown_is_not_implemented_yet(self):
-        self.assertRaises(NotImplementedError,
-                          self._session().post_markdown, '# hi')
+    def test_upload_markdown_delegates_to_the_uploader(self):
+        session = self._session()
+        with mock.patch.object(type(session.uploader), 'upload',
+                               return_value='sentinel') as m_upload:
+            self.assertEqual(session.upload_markdown('note.md'), 'sentinel')
+        m_upload.assert_called_once()
 
 
 class TestEndToEndOffline(ConfigFileTestCase):

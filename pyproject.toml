@@ -23,7 +23,8 @@ dependencies = [
   'passlib',
   'lxml',
   'PyYAML',
-  'markdownify>=0.13'
+  'markdownify>=0.13',
+  'markdown>=3.4'
 ]
 description = "Python library to access Elog."
 readme = "README.md"

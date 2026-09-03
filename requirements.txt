@@ -3,3 +3,4 @@ passlib
 lxml
 PyYAML
 markdownify>=0.13
+markdown>=3.4

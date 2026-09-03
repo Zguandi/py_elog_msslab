@@ -34,8 +34,8 @@ body (HTML converted with markdownify), the YAML frontmatter, and files download
 ``![[name]]``, everything else linked with ``[[name]]``. Pass
 ``attachments=AttachmentHandler()`` to skip downloading and keep the remote URLs.
 
-The reverse direction, Markdown -> ELOG, is still reserved; see ``MarkdownConverter``
-and ``ConvertedMessage`` at the bottom.
+The reverse direction, Markdown -> ELOG, is handled by ``MarkdownUploader``: point it
+at one hand-written note and it becomes a new entry, linked images attached.
 """
 
 import getpass
@@ -72,10 +72,20 @@ __all__ = [
     'export_from_config',
     'export_all_from_config',
     'print_progress',
+    'LogbookUploadError',
+    'split_note',
+    'normalize_tags',
+    'prompt_tags',
+    'prompt_author',
+    'to_latin1_safe',
+    'markdown_to_html',
+    'find_linked_files',
+    'build_attributes',
+    'UploadResult',
+    'MarkdownUploader',
+    'upload_from_config',
     'LogbookSession',
     'open_from_config',
-    'ConvertedMessage',
-    'MarkdownConverter',
 ]
 
 
@@ -105,6 +115,10 @@ class LogbookCredentialsError(LogbookError):
 
 class LogbookExportError(LogbookError):
     """An ELOG entry could not be exported to Markdown."""
+
+
+class LogbookUploadError(LogbookError):
+    """A Markdown note could not be uploaded to ELOG."""
 
 
 class MarkdownFileExistsError(LogbookExportError, FileExistsError):
@@ -652,7 +666,7 @@ def _html_to_markdown(text):
     """Convert an ELOG HTML body to Markdown."""
     # Lazy, matching lxml in Logbook.search and passlib in _handle_pswd. Imported as a
     # module and never `from markdownify import ...`: markdownify exports a class also
-    # named MarkdownConverter, which would shadow this module's outbound seam.
+    # named MarkdownConverter, which would shadow nothing useful but confuses readers.
     try:
         import markdownify
     except ImportError as e:
@@ -1172,6 +1186,431 @@ def export_to_markdown_file(logbook, msg_id, out_dir, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# Outbound: Markdown note -> ELOG entry
+# ---------------------------------------------------------------------------
+
+_FRONTMATTER_FENCE_RE = re.compile(r'^---\r?\n(.*?)\r?\n---\r?\n?', re.DOTALL)
+
+#: Frontmatter keys the exporter writes as bookkeeping. They describe where a note came
+#: from, not what a new entry should say, so they are never sent as attributes.
+_UPLOAD_DROP_KEYS = frozenset(
+    ('id', 'date', 'attachments', 'reply_to', 'in_reply_to', 'encoding'))
+
+#: Characters ELOG's latin-1 wire format cannot carry, and what to send instead.
+#: Everything here appears in real notes; anything not listed falls back to an NFKD
+#: decomposition and finally to '?'.
+_LATIN1_REPLACEMENTS = {
+    '\u2013': '-',      # en dash
+    '\u2014': '--',     # em dash
+    '\u2212': '-',      # minus sign
+    '\u2018': "'",      # left single quote
+    '\u2019': "'",      # right single quote
+    '\u201c': '"',      # left double quote
+    '\u201d': '"',      # right double quote
+    '\u2026': '...',    # ellipsis
+    '\u2248': '~=',     # almost equal to
+    '\u2260': '!=',     # not equal to
+    '\u2264': '<=',
+    '\u2265': '>=',
+    '\u2192': '->',     # rightwards arrow
+    '\u2190': '<-',
+    '\u2713': '[x]',    # check mark
+    '\u2717': '[ ]',
+    '\u00d7': 'x',      # multiplication sign (latin-1 has it, but 'x' reads better)
+    '\u2022': '-',      # bullet
+    '\u00a0': ' ',      # non-breaking space
+}
+
+#: Markdown extensions: fenced code and tables are what a lab note actually uses;
+#: sane_lists stops a '1.' mid-paragraph from restarting a list.
+_MARKDOWN_EXTENSIONS = ('fenced_code', 'tables', 'sane_lists')
+
+#: ![[x.png]] / [[x.png]] / ![](x.png) / [](x.png). Group 'target' is the link body.
+_WIKILINK_RE = re.compile(r'!?\[\[(?P<target>[^\]|#]+?)(?:\|[^\]]*)?\]\]')
+_MDLINK_RE = re.compile(r'!?\[[^\]]*\]\((?P<target>[^)\s]+)(?:\s+"[^"]*")?\)')
+
+
+def split_note(text):
+    """Split a Markdown note into ``(frontmatter, body)``.
+
+    A note without a frontmatter block yields ``({}, text)`` -- hand-written notes often
+    have none, and that is not an error.
+
+    :raises LogbookUploadError: if the frontmatter block is not valid YAML mapping
+    """
+    text = (text or '').lstrip('\ufeff')
+    match = _FRONTMATTER_FENCE_RE.match(text)
+    if match is None:
+        return {}, text
+
+    try:
+        import yaml
+    except ImportError as e:
+        raise LogbookUploadError(
+            'PyYAML is required to read note frontmatter (pip install PyYAML).') from e
+
+    try:
+        document = yaml.safe_load(match.group(1))
+    except yaml.YAMLError as e:
+        raise LogbookUploadError('Cannot parse note frontmatter: {0}'.format(e)) from e
+
+    if document is None:
+        document = {}
+    if not isinstance(document, dict):
+        raise LogbookUploadError(
+            'Note frontmatter must be a mapping, got {0}.'.format(type(document).__name__))
+    return document, text[match.end():]
+
+
+def normalize_tags(values):
+    """Clean a list (or comma-separated string) of tags into ELOG ``Type`` values.
+
+    Each tag is capitalised on its **first letter only** -- ``str.capitalize`` would
+    lowercase the rest and turn 'ADC' into 'Adc'.
+    """
+    if isinstance(values, str):
+        values = values.split(',')
+    tags = []
+    for value in (values or []):
+        tag = str(value).strip()
+        if tag:
+            tags.append(tag[:1].upper() + tag[1:])
+    # Deduplicate while preserving order.
+    return list(dict.fromkeys(tags))
+
+
+def prompt_tags(prompt='Tags (comma-separated): ', max_attempts=3, input_fn=None):
+    """Ask for tags on the terminal, re-asking while the answer is empty.
+
+    ELOG logbooks commonly declare ``Required Attributes = Author, Type``, so an entry
+    with no Type is rejected by the server -- better to insist here.
+
+    :param input_fn: override for ``input``, for testing
+    """
+    reader = input_fn if input_fn is not None else input
+    for remaining in range(max_attempts, 0, -1):
+        try:
+            tags = normalize_tags(reader(prompt))
+        except EOFError as e:
+            raise LogbookUploadError('Input stream closed while reading tags.') from e
+        if tags:
+            return tags
+        if remaining > 1:
+            print('At least one tag is required.', file=sys.stderr)
+    raise LogbookUploadError(
+        'No tags provided after {0} attempt(s).'.format(max_attempts))
+
+
+def prompt_author(prompt='Author: ', max_attempts=3, input_fn=None):
+    """Ask for the entry author on the terminal."""
+    reader = input_fn if input_fn is not None else input
+    for remaining in range(max_attempts, 0, -1):
+        try:
+            author = (reader(prompt) or '').strip()
+        except EOFError as e:
+            raise LogbookUploadError('Input stream closed while reading the author.') from e
+        if author:
+            return author
+        if remaining > 1:
+            print('An author is required.', file=sys.stderr)
+    raise LogbookUploadError(
+        'No author provided after {0} attempt(s).'.format(max_attempts))
+
+
+def to_latin1_safe(text):
+    """Return ``(text, replacements)`` with every non-latin-1 character substituted.
+
+    ELOG's wire format is latin-1 in both directions (``logbook.py`` encodes the body at
+    :276 and every attribute value at :802), so a note containing an em dash or an arrow
+    would otherwise raise ``UnicodeEncodeError`` mid-post.
+
+    :return: the safe text, and a list of ``(original, replacement)`` pairs
+    """
+    if text is None or text.isascii():
+        return text, []
+
+    import unicodedata
+
+    out = []
+    replacements = []
+    for char in text:
+        if ord(char) < 256:
+            out.append(char)
+            continue
+        if char in _LATIN1_REPLACEMENTS:
+            replacement = _LATIN1_REPLACEMENTS[char]
+        else:
+            # Strip accents and the like down to something latin-1 can carry.
+            decomposed = unicodedata.normalize('NFKD', char)
+            candidate = ''.join(c for c in decomposed if ord(c) < 256)
+            replacement = candidate if candidate.strip() else '?'
+        out.append(replacement)
+        replacements.append((char, replacement))
+    return ''.join(out), replacements
+
+
+def markdown_to_html(body):
+    """Render Markdown to the HTML that ELOG stores for ``encoding='HTML'``."""
+    # Lazy, matching lxml in Logbook.search and markdownify in _html_to_markdown.
+    try:
+        import markdown as markdown_module
+    except ImportError as e:
+        raise LogbookUploadError(
+            'markdown is required to upload Markdown notes to ELOG '
+            '(pip install markdown).') from e
+    return markdown_module.markdown(body or '', extensions=list(_MARKDOWN_EXTENSIONS))
+
+
+def _link_targets(body):
+    """Every link target in the body, in order of appearance, deduplicated."""
+    targets = []
+    for pattern in (_WIKILINK_RE, _MDLINK_RE):
+        for match in pattern.finditer(body or ''):
+            target = match.group('target').strip()
+            if target and target not in targets:
+                targets.append(target)
+    return targets
+
+
+def find_linked_files(body, note_dir):
+    """Resolve the files a note links to.
+
+    Looks beside the note first, then in ``<note_dir>/attachments/`` -- the layout the
+    exporter writes and Obsidian vaults commonly use.
+
+    :return: ``(files, unresolved)`` -- a list of existing ``Path`` and a list of link
+             targets that point at nothing on disk
+    """
+    from urllib.parse import unquote
+
+    note_dir = Path(note_dir)
+    files = []
+    unresolved = []
+
+    for target in _link_targets(body):
+        if re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', target):
+            continue                              # external URL, not ours to upload
+        name = unquote(target)
+        candidates = [Path(name)] if Path(name).is_absolute() else [
+            note_dir / name, note_dir / 'attachments' / name]
+        for candidate in candidates:
+            if candidate.is_file():
+                if candidate not in files:
+                    files.append(candidate)
+                break
+        else:
+            unresolved.append(target)
+    return files, unresolved
+
+
+def build_attributes(frontmatter, note_path, author=None, tags=None,
+                     extra_attributes=None):
+    """Map note frontmatter onto ELOG attributes.
+
+    ``When`` is deliberately absent: ``Logbook.post`` stamps ``datetime.now()`` on a new
+    entry itself (``logbook.py:265``), which is the wanted behaviour.
+
+    :param author: overrides the frontmatter ``author``
+    :param tags: overrides the frontmatter ``tags``
+    :param extra_attributes: sent verbatim, the escape hatch for site-specific attributes
+    """
+    frontmatter = frontmatter or {}
+
+    subject = str(frontmatter.get('subject') or '').strip()
+    if not subject:
+        # "Infer the subject from the file name" -- the stem, verbatim.
+        subject = Path(note_path).stem
+
+    resolved_tags = normalize_tags(tags if tags is not None else frontmatter.get('tags'))
+
+    attributes = {'Subject': subject}
+    if resolved_tags:
+        attributes['Type'] = ' | '.join(resolved_tags)
+    if author:
+        attributes['Author'] = author
+    attributes.update(extra_attributes or {})
+    return attributes
+
+
+@dataclass
+class UploadResult:
+    """What one upload did.
+
+    A result object rather than a bare ``msg_id`` so that a partial success -- entry
+    created, inline-image edit failed -- is visible instead of silent.
+    """
+
+    msg_id: int
+    attachments: list = field(default_factory=list)      # [Path] uploaded
+    unresolved: list = field(default_factory=list)       # [str] links pointing nowhere
+    transliterated: list = field(default_factory=list)   # [(char, replacement)]
+    inlined: bool = False                                # did the phase-2 edit run
+
+    def summary(self):
+        """A one-line human-readable tally."""
+        return ('entry {0}: {1} attachment(s), {2} unresolved link(s), '
+                '{3} character(s) transliterated, inline images {4}'.format(
+                    self.msg_id, len(self.attachments), len(self.unresolved),
+                    len(self.transliterated), 'yes' if self.inlined else 'no'))
+
+
+class MarkdownUploader:
+    """Posts a single hand-written Markdown note to ELOG as a new entry.
+
+    Composition over a ``Logbook``, like :class:`MarkdownExporter`, so the whole flow can
+    be exercised against a small fake.
+    """
+
+    def __init__(self, logbook, author=None, tags=None, inline_images=True,
+                 input_fn=None, timeout=None):
+        """
+        :param logbook: an ``elog.logbook.Logbook``
+        :param author: used when the note has no ``author`` frontmatter; prompted if unset
+        :param tags: used when the note has no ``tags`` frontmatter; prompted if unset
+        :param inline_images: after posting, edit the entry so linked images render
+                              inline. Costs a read plus an edit; off means the files are
+                              still attached, just not embedded in the text.
+        :param input_fn: override for ``input``, for testing
+        :param timeout: request timeout in seconds
+        """
+        self.logbook = logbook
+        self.author = author
+        self.tags = tags
+        self.inline_images = inline_images
+        self.input_fn = input_fn
+        self.timeout = timeout
+
+    def upload(self, note_path, extra_attributes=None):
+        """Post one Markdown note as a new ELOG entry.
+
+        :param note_path: path to the ``.md`` file
+        :return: an :class:`UploadResult`
+        :raises LogbookUploadError: for a missing or unreadable note, or bad frontmatter
+        """
+        path = Path(note_path)
+        if not path.is_file():
+            raise LogbookUploadError('No such Markdown file: {0}'.format(path))
+        try:
+            text = path.read_text(encoding='utf-8')
+        except OSError as e:
+            raise LogbookUploadError('Cannot read {0}: {1}'.format(path, e)) from e
+
+        frontmatter, body = split_note(text)
+        if frontmatter.get('id') is not None:
+            warnings.warn(
+                'Note carries id {0}, so it looks exported from ELOG; uploading creates '
+                'a NEW entry rather than updating that one.'.format(frontmatter['id']),
+                stacklevel=2)
+
+        files, unresolved = find_linked_files(body, path.parent)
+        for target in unresolved:
+            warnings.warn('Linked file not found, not uploaded: {0}'.format(target),
+                          stacklevel=2)
+
+        author = self.author or str(frontmatter.get('author') or '').strip()
+        if not author:
+            author = prompt_author(input_fn=self.input_fn)
+
+        tags = normalize_tags(
+            self.tags if self.tags is not None else frontmatter.get('tags'))
+        if not tags:
+            tags = prompt_tags(input_fn=self.input_fn)
+
+        attributes = build_attributes(frontmatter, path, author=author, tags=tags,
+                                      extra_attributes=extra_attributes)
+
+        html = markdown_to_html(body)
+        html, replaced = to_latin1_safe(html)
+        attributes, attribute_replaced = self._sanitize_attributes(attributes)
+        replaced = replaced + attribute_replaced
+        if replaced:
+            warnings.warn(
+                '{0} character(s) ELOG cannot store were replaced: {1}'.format(
+                    len(replaced),
+                    ', '.join(sorted({'{0!r}->{1!r}'.format(a, b) for a, b in replaced}))),
+                stacklevel=2)
+
+        # _prepare_attachments tests isinstance(file_obj, str); a Path raises
+        # LogbookInvalidAttachmentType (logbook.py:663).
+        msg_id = self.logbook.post(html, attributes=attributes,
+                                   attachments=[str(p) for p in files],
+                                   encoding='HTML', timeout=self.timeout)
+
+        result = UploadResult(msg_id=msg_id, attachments=files, unresolved=unresolved,
+                              transliterated=replaced)
+
+        # Past this point the entry exists. Nothing below may raise, or the caller would
+        # retry and create a duplicate.
+        if self.inline_images and files:
+            result.inlined = self._inline_images(msg_id, body, files)
+        return result
+
+    @staticmethod
+    def _sanitize_attributes(attributes):
+        """Apply :func:`to_latin1_safe` to every string attribute value."""
+        safe = {}
+        replaced = []
+        for key, value in attributes.items():
+            if isinstance(value, str):
+                value, changed = to_latin1_safe(value)
+                replaced.extend(changed)
+            safe[key] = value
+        return safe, replaced
+
+    def _inline_images(self, msg_id, body, files):
+        """Rewrite the entry body so its linked files point at the stored attachments.
+
+        ELOG renames each upload to ``<YYMMDD>_<HHMMSS>_<name>``, which is only knowable
+        after posting -- hence read back, then edit. Returns True when the edit ran.
+        """
+        try:
+            stored = self.logbook.read(msg_id, timeout=self.timeout)[2]
+            # _prepare_attachments replaces spaces with underscores (logbook.py:675),
+            # so match on the same transformation or every file with a space is missed.
+            by_name = {}
+            for url in stored:
+                name = _attachment_name(url)
+                by_name[name[14:] or name] = name
+
+            html = markdown_to_html(self._rewrite_links(body, files, by_name))
+            html, _ = to_latin1_safe(html)
+            self.logbook.post(html, msg_id=msg_id, timeout=self.timeout)
+            return True
+        except (LogbookError, ValueError, OSError) as e:
+            warnings.warn(
+                'Entry {0} was created, but linking its images inline failed: {1}'.format(
+                    msg_id, e), stacklevel=3)
+            return False
+
+    @staticmethod
+    def _rewrite_links(body, files, by_name):
+        """Point each link at its stored attachment name, before HTML conversion."""
+        for path in files:
+            stored = by_name.get(path.name.replace(' ', '_'))
+            if stored is None:
+                continue
+            link = ('![{0}]({1})' if _is_embeddable(stored) else '[{0}]({1})').format(
+                path.name, stored)
+            quoted = re.escape(path.name)
+            for pattern in (r'!?\[\[' + quoted + r'(?:\|[^\]]*)?\]\]',
+                            r'!?\[[^\]]*\]\(' + quoted + r'\)'):
+                body = re.sub(pattern, link.replace('\\', r'\\'), body)
+        return body
+
+
+def upload_from_config(config_path, note_path, strict=True, **kwargs):
+    """Upload one Markdown note from a YAML config file, prompting for credentials::
+
+        result = upload_from_config('elog.yaml', 'D:/notes/20260730-pos23.md')
+        print(result.summary())
+    """
+    session_kwargs = {k: kwargs.pop(k) for k in
+                      ('credentials', 'prompter', 'timeout') if k in kwargs}
+    session = LogbookSession.from_config_file(config_path, strict=strict, **session_kwargs)
+    return session.upload_markdown(note_path, **kwargs)
+
+
+# ---------------------------------------------------------------------------
 # Session / factory
 # ---------------------------------------------------------------------------
 
@@ -1182,14 +1621,12 @@ class LogbookSession:
     pure data or terminal-I/O concern.
     """
 
-    def __init__(self, config, credentials=None, prompter=None, converter=None,
+    def __init__(self, config, credentials=None, prompter=None,
                  attachments=None, timeout=None):
         """
         :param config: a :class:`LogbookConfig`
         :param credentials: pre-supplied credentials; prompted for when omitted
         :param prompter: a :class:`CredentialPrompter`; a default one is made if omitted
-        :param converter: reserved for the future outbound Markdown converter, see
-                          :class:`MarkdownConverter`
         :param attachments: an :class:`AttachmentHandler` for exports; the link-only
                             stub by default
         :param timeout: request timeout in seconds, used by ``verify`` and by exports
@@ -1197,11 +1634,11 @@ class LogbookSession:
         self.config = config
         self.credentials = credentials
         self._prompter = prompter if prompter is not None else CredentialPrompter()
-        self._converter = converter
         self._attachments = attachments
         self._timeout = timeout
         self._logbook = None
         self._exporter = None
+        self._uploader = None
 
     @classmethod
     def from_config_file(cls, path, strict=True, **kwargs):
@@ -1282,15 +1719,23 @@ class LogbookSession:
         """
         return self.exporter.export_all(out_dir, **kwargs)
 
-    def post_markdown(self, markdown_text, **kwargs):
-        """Convert Markdown and post it. Not implemented yet.
+    @property
+    def uploader(self):
+        """The :class:`MarkdownUploader`, built (and connecting) on first access."""
+        if self._uploader is None:
+            self._uploader = MarkdownUploader(self.logbook, timeout=self._timeout)
+        return self._uploader
 
-        The seam is reserved so that adding a converter later is not a signature
-        change; see :class:`MarkdownConverter`.
+    def upload_markdown(self, note_path, **kwargs):
+        """Post one hand-written Markdown note as a new ELOG entry.
+
+        See :meth:`MarkdownUploader.upload` for the parameters; uploader options
+        (``author``, ``tags``, ``inline_images``, ``input_fn``) may be passed here too.
         """
-        raise NotImplementedError(
-            'Markdown conversion is not implemented yet. Pass a converter to '
-            'LogbookSession(converter=...) once one exists.')
+        for option in ('author', 'tags', 'inline_images', 'input_fn'):
+            if option in kwargs:
+                setattr(self.uploader, option, kwargs.pop(option))
+        return self.uploader.upload(note_path, **kwargs)
 
 
 def open_from_config(path, strict=True, verify=False, **kwargs):
@@ -1336,32 +1781,3 @@ def print_progress(done, total, msg_id, status):
     end = '\n' if done == total else ''
     print('\r  [{0}/{1}] {2} {3}    '.format(done, total, status, msg_id),
           end=end, file=sys.stderr, flush=True)
-
-
-# ---------------------------------------------------------------------------
-# Markdown seam -- reserved, not implemented
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ConvertedMessage:
-    """The result of converting Markdown into something ``Logbook.post`` accepts.
-
-    A dataclass rather than a (body, encoding) tuple because Markdown image links will
-    eventually have to become ELOG attachments: adding a field is additive, widening a
-    tuple would break every caller.
-    """
-
-    body: str
-    #: One of 'plain', 'HTML' or 'ELCode' -- case sensitive, see Logbook.post.
-    encoding: str = 'ELCode'
-    attachments: list = field(default_factory=list)
-
-
-class MarkdownConverter:
-    """Interface for turning Markdown into a :class:`ConvertedMessage`.
-
-    Implement ``convert`` and pass an instance as ``LogbookSession(converter=...)``.
-    """
-
-    def convert(self, markdown_text):
-        raise NotImplementedError

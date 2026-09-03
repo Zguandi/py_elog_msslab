@@ -16,6 +16,7 @@ requirements:
         - lxml
         - pyyaml
         - markdownify
+        - markdown
 
     run:
         - python
@@ -24,6 +25,7 @@ requirements:
         - lxml
         - pyyaml
         - markdownify
+        - markdown
 
 about:
     home: https://github.com/paulscherrerinstitute/py_elog

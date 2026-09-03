@@ -233,6 +233,78 @@ if not result:
 By default every entry is re-exported so edits made on the server propagate. Use
 `skip_existing=True` to only fetch entries with no `.md` file yet.
 
+## Upload a Markdown Note to ELOG
+
+The reverse of the export: point at one hand-written Markdown note and it becomes a new
+ELOG entry, with its linked images attached and embedded.
+
+```python
+from elog.logbook_md import upload_from_config
+
+result = upload_from_config('elog.yaml', 'D:/notes/20260730-pos23.md')
+print(result.summary())
+# entry 91: 1 attachment(s), 0 unresolved link(s), 3 character(s) transliterated,
+# inline images yes
+```
+
+On Windows, resolve a pasted path first — see
+[`elog.path_utils_win`](elog/path_utils_win.py):
+
+```python
+import os
+from elog.path_utils_win import to_path
+
+raw = input('Markdown file: ')
+note = to_path(raw, must_exist=True) if os.name == 'nt' else Path(raw.strip())
+```
+
+Frontmatter maps onto ELOG attributes:
+
+| Frontmatter | ELOG | Rule |
+| --- | --- | --- |
+| `subject` | `Subject` | falls back to the note's **filename stem** |
+| `tags` | `Type` | joined with ` \| `; **prompted** (comma-separated) when absent |
+| `author` | `Author` | **prompted** when absent |
+| — | `When` | not sent; ELOG stamps the current time on a new entry |
+
+Tags are capitalised on their first letter only, so `adc` becomes `Adc` but `ADC` stays
+`ADC`. Bookkeeping keys the exporter writes (`id`, `date`, `attachments`, `reply_to`) are
+dropped; a note carrying `id` warns that upload creates a **new** entry rather than
+updating that one. Anything else needs `extra_attributes={...}`.
+
+The body is rendered to HTML (python-markdown: fenced code, tables, sane lists) and posted
+with `encoding='HTML'`, so the exporter converts it back to equivalent Markdown.
+
+Linked files — `![[x.png]]`, `[[x.png]]`, `![](x.png)`, `[](x.png)` — are resolved beside
+the note, then in `<note_dir>/attachments/`. External URLs are skipped; links pointing at
+nothing are reported in `result.unresolved` rather than silently dropped.
+
+__Note:__ ELOG stores the body and every attribute as latin-1, which cannot represent en
+and em dashes, `−`, `≈`, `→` or `✓` — characters ordinary lab notes pick up. Those are
+transliterated (`—`→`--`, `≈`→`~=`, `→`→`->`), reported in `result.transliterated`, and
+warned about once. Without this, `post()` raises `UnicodeEncodeError` mid-upload.
+
+### Inline images
+
+ELOG renames each upload to `<YYMMDD>_<HHMMSS>_<name>` and only reveals that name *after*
+the post, so linking images inline takes two steps: post, read the stored names back, then
+edit the body. This is automatic; pass `inline_images=False` to skip it, leaving the files
+attached but not embedded.
+
+Because the entry already exists once the first post returns, a failure in that second step
+never raises — `upload()` returns the `msg_id` with `inlined=False` and warns, so a retry
+cannot create a duplicate.
+
+```python
+from elog.logbook_md import MarkdownUploader
+
+uploader = MarkdownUploader(logbook, author='Guandi', tags=['Hardware'])
+result = uploader.upload('D:/notes/20260730-pos23.md')
+```
+
+Uploading is one note per call, always as a new entry. Replying to or editing an existing
+entry is not wired up yet.
+
 ## Get Existing Message Ids
 Get all the existing message ids of a logbook
 
