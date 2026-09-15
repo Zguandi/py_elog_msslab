@@ -1,11 +1,16 @@
 import requests
 import urllib.parse
+import urllib3
 import os
 import builtins
 import re
 import sys
 from elog.logbook_exceptions import *
 from datetime import datetime
+
+# All requests below use verify=False (self-signed certs are common on lab ELOG
+# servers), which makes urllib3 emit an InsecureRequestWarning on every call.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 class Logbook(object):

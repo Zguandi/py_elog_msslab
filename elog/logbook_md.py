@@ -150,6 +150,53 @@ def _coerce_str(value, key, errors, default=''):
     return value.strip()
 
 
+def _coerce_str_list(value, key, errors, default=()):
+    """Return ``value`` as a tuple of stripped strings. ``None`` becomes ``default``."""
+    if value is None:
+        return tuple(default)
+    if not isinstance(value, list):
+        errors.append("'{0}' must be a list of strings, got {1!r}".format(key, value))
+        return tuple(default)
+    items = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, str):
+            errors.append("'{0}' entries must be strings, got {1!r}".format(key, item))
+            continue
+        item = item.strip()
+        if item:
+            items.append(item)
+    return tuple(items)
+
+
+#: Recognised keys under the 'upload' mapping.
+_UPLOAD_FIELDS = ('attachment_folders',)
+
+
+def _coerce_upload_section(value, errors, strict):
+    """Parse the optional 'upload' mapping and return its ``attachment_folders``.
+
+    :param value: ``mapping['upload']``, or ``None`` if the key is absent
+    :param strict: unknown sub-keys raise if True, else only warn
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        errors.append("'upload' must be a mapping, got {0!r}".format(value))
+        return ()
+
+    unknown = sorted(set(value) - set(_UPLOAD_FIELDS))
+    if unknown:
+        message = "Unknown key(s) under 'upload': {0}. Valid keys are: {1}.".format(
+            ', '.join(repr(k) for k in unknown), ', '.join(_UPLOAD_FIELDS))
+        if strict:
+            errors.append(message)
+        else:
+            warnings.warn(message, stacklevel=3)
+
+    return _coerce_str_list(value.get('attachment_folders'), 'upload.attachment_folders',
+                            errors)
+
+
 def _coerce_bool(value, key, errors, default=True):
     """Return ``value`` as a bool, accepting the usual YAML-ish string spellings.
 
@@ -232,9 +279,13 @@ class LogbookConfig:
     port: int = None
     subdir: str = ''
     use_ssl: bool = True
+    #: Folder names (relative to a note's own directory) to search for a linked
+    #: attachment when it is not found beside the note itself. From the YAML config's
+    #: ``upload.attachment_folders``.
+    attachment_folders: tuple = ()
 
-    #: Recognised YAML keys. Anything else is rejected by ``from_mapping``.
-    FIELDS = ('hostname', 'logbook', 'port', 'subdir', 'use_ssl')
+    #: Recognised top-level YAML keys. Anything else is rejected by ``from_mapping``.
+    FIELDS = ('hostname', 'logbook', 'port', 'subdir', 'use_ssl', 'upload')
 
     @classmethod
     def from_mapping(cls, mapping, strict=True):
@@ -269,6 +320,7 @@ class LogbookConfig:
         subdir = _coerce_str(mapping.get('subdir'), 'subdir', errors).strip('/')
         hostname = _normalize_hostname(
             _coerce_str(mapping.get('hostname'), 'hostname', errors), use_ssl, errors)
+        attachment_folders = _coerce_upload_section(mapping.get('upload'), errors, strict)
 
         cls._check_conflicts(hostname, mapping, use_ssl, subdir, port, errors)
 
@@ -277,6 +329,7 @@ class LogbookConfig:
                 'Invalid logbook configuration:\n  - ' + '\n  - '.join(errors))
 
         return cls(hostname=hostname, logbook=logbook, port=port,
+                   attachment_folders=attachment_folders,
                    subdir=subdir, use_ssl=use_ssl)
 
     @staticmethod
@@ -662,13 +715,47 @@ _MARKDOWNIFY_OPTIONS = {
 }
 
 
+#: Same character class as markdownify's own re_escape_misc_chars, minus the backslash
+#: itself. escape_misc otherwise escapes a literal '\' along with '&<`[]>~=+|', which
+#: turns e.g. a LaTeX '\frac{1}{4}' into '\\frac{1}{4}' on every export -- and re-uploading
+#: an edited note then sends the doubled backslash back to ELOG. The other protections
+#: escape_misc provides (leading '#', '-', list markers) are kept as-is.
+_ESCAPE_MISC_CHARS_NO_BACKSLASH_RE = re.compile(r'([]&<`\[>~=+|])')
+
+
+def _markdownify_converter_class():
+    """Build a ``MarkdownConverter`` subclass that never escapes a literal backslash.
+
+    Defined lazily, alongside the ``import markdownify`` it depends on, so this module
+    stays importable without markdownify installed.
+    """
+    import markdownify
+
+    class _NoBackslashEscapeConverter(markdownify.MarkdownConverter):
+        def escape(self, text, parent_tags):
+            if not text:
+                return ''
+            if self.options['escape_misc']:
+                text = _ESCAPE_MISC_CHARS_NO_BACKSLASH_RE.sub(r'\\\1', text)
+                text = markdownify.re_escape_misc_dash_sequences.sub(r'\1\\\2', text)
+                text = markdownify.re_escape_misc_hashes.sub(r'\1\\\2', text)
+                text = markdownify.re_escape_misc_list_items.sub(r'\1\\\2', text)
+            if self.options['escape_asterisks']:
+                text = text.replace('*', r'\*')
+            if self.options['escape_underscores']:
+                text = text.replace('_', r'\_')
+            return text
+
+    return _NoBackslashEscapeConverter
+
+
 def _html_to_markdown(text):
     """Convert an ELOG HTML body to Markdown."""
     # Lazy, matching lxml in Logbook.search and passlib in _handle_pswd. Imported as a
     # module and never `from markdownify import ...`: markdownify exports a class also
     # named MarkdownConverter, which would shadow nothing useful but confuses readers.
     try:
-        import markdownify
+        converter_class = _markdownify_converter_class()
     except ImportError as e:
         raise LogbookExportError(
             'markdownify is required to convert HTML ELOG entries to Markdown '
@@ -677,7 +764,7 @@ def _html_to_markdown(text):
     # markdownify's strip= removes only the tag and keeps its text, so a <script> body
     # would land in the note as prose. Drop those elements outright first.
     text = _DANGEROUS_RE.sub('', text)
-    return markdownify.markdownify(text, **_MARKDOWNIFY_OPTIONS)
+    return converter_class(**_MARKDOWNIFY_OPTIONS).convert(text)
 
 
 def _plain_to_markdown(text):
@@ -1375,18 +1462,26 @@ def _link_targets(body):
     return targets
 
 
-def find_linked_files(body, note_dir):
+def find_linked_files(body, note_dir, attachment_folders=None):
     """Resolve the files a note links to.
 
     Looks beside the note first, then in ``<note_dir>/attachments/`` -- the layout the
-    exporter writes and Obsidian vaults commonly use.
+    exporter writes and Obsidian vaults commonly use -- then in each of
+    ``attachment_folders`` (also relative to ``note_dir``), in order.
 
+    :param attachment_folders: extra folder names to try after ``attachments``, e.g. from
+                               the YAML config's ``upload.attachment_folders``
     :return: ``(files, unresolved)`` -- a list of existing ``Path`` and a list of link
              targets that point at nothing on disk
     """
     from urllib.parse import unquote
 
     note_dir = Path(note_dir)
+    folders = ['attachments']
+    for folder in (attachment_folders or ()):
+        if folder not in folders:
+            folders.append(folder)
+
     files = []
     unresolved = []
 
@@ -1395,7 +1490,7 @@ def find_linked_files(body, note_dir):
             continue                              # external URL, not ours to upload
         name = unquote(target)
         candidates = [Path(name)] if Path(name).is_absolute() else [
-            note_dir / name, note_dir / 'attachments' / name]
+            note_dir / name] + [note_dir / folder / name for folder in folders]
         for candidate in candidates:
             if candidate.is_file():
                 if candidate not in files:
@@ -1465,7 +1560,7 @@ class MarkdownUploader:
     """
 
     def __init__(self, logbook, author=None, tags=None, inline_images=True,
-                 input_fn=None, timeout=None):
+                 input_fn=None, timeout=None, attachment_folders=None):
         """
         :param logbook: an ``elog.logbook.Logbook``
         :param author: used when the note has no ``author`` frontmatter; prompted if unset
@@ -1475,6 +1570,10 @@ class MarkdownUploader:
                               still attached, just not embedded in the text.
         :param input_fn: override for ``input``, for testing
         :param timeout: request timeout in seconds
+        :param attachment_folders: extra folder names (relative to the note's own
+                                   directory) to search for a linked attachment when it
+                                   is not found beside the note or in ``attachments/``.
+                                   See :func:`find_linked_files`.
         """
         self.logbook = logbook
         self.author = author
@@ -1482,6 +1581,7 @@ class MarkdownUploader:
         self.inline_images = inline_images
         self.input_fn = input_fn
         self.timeout = timeout
+        self.attachment_folders = attachment_folders
 
     def upload(self, note_path, extra_attributes=None):
         """Post one Markdown note as a new ELOG entry.
@@ -1505,7 +1605,8 @@ class MarkdownUploader:
                 'a NEW entry rather than updating that one.'.format(frontmatter['id']),
                 stacklevel=2)
 
-        files, unresolved = find_linked_files(body, path.parent)
+        files, unresolved = find_linked_files(body, path.parent,
+                                              attachment_folders=self.attachment_folders)
         for target in unresolved:
             warnings.warn('Linked file not found, not uploaded: {0}'.format(target),
                           stacklevel=2)
@@ -1726,16 +1827,19 @@ class LogbookSession:
     def uploader(self):
         """The :class:`MarkdownUploader`, built (and connecting) on first access."""
         if self._uploader is None:
-            self._uploader = MarkdownUploader(self.logbook, timeout=self._timeout)
+            self._uploader = MarkdownUploader(
+                self.logbook, timeout=self._timeout,
+                attachment_folders=self.config.attachment_folders)
         return self._uploader
 
     def upload_markdown(self, note_path, **kwargs):
         """Post one hand-written Markdown note as a new ELOG entry.
 
         See :meth:`MarkdownUploader.upload` for the parameters; uploader options
-        (``author``, ``tags``, ``inline_images``, ``input_fn``) may be passed here too.
+        (``author``, ``tags``, ``inline_images``, ``input_fn``, ``attachment_folders``)
+        may be passed here too, overriding the config's ``upload.attachment_folders``.
         """
-        for option in ('author', 'tags', 'inline_images', 'input_fn'):
+        for option in ('author', 'tags', 'inline_images', 'input_fn', 'attachment_folders'):
             if option in kwargs:
                 setattr(self.uploader, option, kwargs.pop(option))
         return self.uploader.upload(note_path, **kwargs)

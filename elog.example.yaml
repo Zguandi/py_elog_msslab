@@ -22,3 +22,15 @@ subdir: elogs
 
 # Connect over https. Default: true. Ignored if hostname carries an explicit scheme.
 # use_ssl: true
+
+upload:
+  attachment_folders:
+  - attachments
+  - pictures
+  
+# upload attachment folder. The script will try to find attachments in the directory named above.
+# Folder structure:
+# - upload.md
+# - attachments/
+#   - file1.png
+#   - file2.png
