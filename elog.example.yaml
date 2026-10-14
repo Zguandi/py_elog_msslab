@@ -27,10 +27,17 @@ upload:
   attachment_folders:
   - attachments
   - pictures
-  
-# upload attachment folder. The script will try to find attachments in the directory named above.
-# Folder structure:
-# - upload.md
-# - attachments/
-#   - file1.png
-#   - file2.png
+
+  # upload attachment folder. The script will try to find attachments in the directory named above.
+  # Folder structure:
+  # - upload.md
+  # - attachments/
+  #   - file1.png
+  #   - file2.png
+
+  # Per-attachment size cap in megabytes, matching the server's own upload limit (this
+  # server caps uploads around 10 MB). An oversized image is re-encoded -- lower JPEG
+  # quality first, then downscaled -- to fit; any other oversized attachment (a PDF, a
+  # video) is skipped with a warning instead of being sent and rejected by the server.
+  # Default: unset, meaning no cap is applied.
+  max_attachment_size_mb: 10

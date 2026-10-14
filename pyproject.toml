@@ -24,7 +24,8 @@ dependencies = [
   'lxml',
   'PyYAML',
   'markdownify>=0.13',
-  'markdown>=3.4'
+  'markdown>=3.4',
+  'Pillow>=10'
 ]
 description = "Python library to access Elog."
 readme = "README.md"

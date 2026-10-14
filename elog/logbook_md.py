@@ -39,8 +39,10 @@ at one hand-written note and it becomes a new entry, linked images attached.
 """
 
 import getpass
+import io
 import re
 import sys
+import tempfile
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -168,21 +170,40 @@ def _coerce_str_list(value, key, errors, default=()):
     return tuple(items)
 
 
+def _coerce_positive_float(value, key, errors, default=None):
+    """Return ``value`` as a positive ``float``. ``None`` becomes ``default``."""
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        errors.append("'{0}' must be a number, got {1!r}".format(key, value))
+        return default
+    try:
+        number = float(value)
+    except ValueError:
+        errors.append("'{0}' must be a number, got {1!r}".format(key, value))
+        return default
+    if number <= 0:
+        errors.append("'{0}' must be greater than 0, got {1!r}".format(key, value))
+        return default
+    return number
+
+
 #: Recognised keys under the 'upload' mapping.
-_UPLOAD_FIELDS = ('attachment_folders',)
+_UPLOAD_FIELDS = ('attachment_folders', 'max_attachment_size_mb')
 
 
 def _coerce_upload_section(value, errors, strict):
-    """Parse the optional 'upload' mapping and return its ``attachment_folders``.
+    """Parse the optional 'upload' mapping.
 
     :param value: ``mapping['upload']``, or ``None`` if the key is absent
     :param strict: unknown sub-keys raise if True, else only warn
+    :return: ``(attachment_folders, max_attachment_size_mb)``
     """
     if value is None:
-        return ()
+        return (), None
     if not isinstance(value, dict):
         errors.append("'upload' must be a mapping, got {0!r}".format(value))
-        return ()
+        return (), None
 
     unknown = sorted(set(value) - set(_UPLOAD_FIELDS))
     if unknown:
@@ -193,8 +214,11 @@ def _coerce_upload_section(value, errors, strict):
         else:
             warnings.warn(message, stacklevel=3)
 
-    return _coerce_str_list(value.get('attachment_folders'), 'upload.attachment_folders',
-                            errors)
+    attachment_folders = _coerce_str_list(
+        value.get('attachment_folders'), 'upload.attachment_folders', errors)
+    max_attachment_size_mb = _coerce_positive_float(
+        value.get('max_attachment_size_mb'), 'upload.max_attachment_size_mb', errors)
+    return attachment_folders, max_attachment_size_mb
 
 
 def _coerce_bool(value, key, errors, default=True):
@@ -283,6 +307,10 @@ class LogbookConfig:
     #: attachment when it is not found beside the note itself. From the YAML config's
     #: ``upload.attachment_folders``.
     attachment_folders: tuple = ()
+    #: Per-attachment size cap in megabytes. ``None`` means no cap. An oversized image
+    #: is compressed to fit; any other oversized attachment is skipped. From the YAML
+    #: config's ``upload.max_attachment_size_mb``.
+    max_attachment_size_mb: float = None
 
     #: Recognised top-level YAML keys. Anything else is rejected by ``from_mapping``.
     FIELDS = ('hostname', 'logbook', 'port', 'subdir', 'use_ssl', 'upload')
@@ -320,7 +348,8 @@ class LogbookConfig:
         subdir = _coerce_str(mapping.get('subdir'), 'subdir', errors).strip('/')
         hostname = _normalize_hostname(
             _coerce_str(mapping.get('hostname'), 'hostname', errors), use_ssl, errors)
-        attachment_folders = _coerce_upload_section(mapping.get('upload'), errors, strict)
+        attachment_folders, max_attachment_size_mb = _coerce_upload_section(
+            mapping.get('upload'), errors, strict)
 
         cls._check_conflicts(hostname, mapping, use_ssl, subdir, port, errors)
 
@@ -330,6 +359,7 @@ class LogbookConfig:
 
         return cls(hostname=hostname, logbook=logbook, port=port,
                    attachment_folders=attachment_folders,
+                   max_attachment_size_mb=max_attachment_size_mb,
                    subdir=subdir, use_ssl=use_ssl)
 
     @staticmethod
@@ -1501,6 +1531,96 @@ def find_linked_files(body, note_dir, attachment_folders=None):
     return files, unresolved
 
 
+#: Raster formats Pillow can re-encode to shrink a file. Deliberately excludes '.svg'
+#: (vector, not a byte-size problem the same way) and '.gif' (compressing an animation
+#: frame-by-frame is a different problem than a single oversized photo).
+_COMPRESSIBLE_IMAGE_SUFFIXES = frozenset(
+    ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.webp'))
+
+#: Quality drops by this much each retry, down to the floor below. Chosen so a handful
+#: of steps (85 -> 70 -> 55 -> 40 -> 25) span "barely smaller" to "visibly lossy" without
+#: looping forever on a file that will never fit.
+_COMPRESS_QUALITY_STEP = 15
+_COMPRESS_QUALITY_FLOOR = 25
+#: Resize factor applied once quality alone cannot reach the target.
+_COMPRESS_RESIZE_FACTOR = 0.85
+#: Stop resizing once either dimension would drop below this, so a chat-sized target on
+#: a tiny icon does not shrink it into an unusable sliver.
+_COMPRESS_MIN_DIMENSION = 400
+#: Hard cap on resize/quality rounds, so a pathological image cannot loop forever.
+_COMPRESS_MAX_ATTEMPTS = 24
+
+
+def is_compressible_image(path):
+    """True when :func:`compress_image_to_limit` knows how to shrink this file."""
+    return Path(path).suffix.lower() in _COMPRESSIBLE_IMAGE_SUFFIXES
+
+
+def compress_image_to_limit(path, max_bytes):
+    """Re-encode an image until it fits ``max_bytes``, trying quality before size.
+
+    Alternates two levers: for formats with a quality knob (JPEG, WEBP), lower quality
+    first since it costs nothing visually until it does; once quality bottoms out (or
+    the format has none, e.g. PNG), downscale the resolution and try again. The file
+    keeps its original name and format -- only the bytes change -- so a caller that
+    matches attachments by filename (:class:`MarkdownUploader`'s inline-image rewrite)
+    needs no changes.
+
+    :param path: source image path; never modified
+    :param max_bytes: target size in bytes
+    :return: ``(data, reached_target)`` -- the best encoding found, and whether it is
+             actually under ``max_bytes`` (``False`` means this is just the smallest
+             this function could manage)
+    """
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise LogbookUploadError(
+            'Pillow is required to compress image attachments '
+            '(pip install Pillow).') from e
+
+    path = Path(path)
+    image = Image.open(path)
+    image.load()  # the file handle closes once we leave this scope; load eagerly
+    fmt = image.format or path.suffix.lstrip('.').upper()
+    has_quality = fmt in ('JPEG', 'WEBP')
+
+    # JPEG cannot carry an alpha channel or a palette; flatten onto white first.
+    if fmt == 'JPEG' and image.mode in ('RGBA', 'LA', 'P'):
+        background = Image.new('RGB', image.size, (255, 255, 255))
+        background.paste(image.convert('RGBA'), mask=image.convert('RGBA').split()[-1])
+        image = background
+
+    def encode(candidate, quality):
+        buffer = io.BytesIO()
+        kwargs = {'optimize': True}
+        if has_quality:
+            kwargs['quality'] = quality
+        candidate.save(buffer, format=fmt, **kwargs)
+        return buffer.getvalue()
+
+    quality = 85
+    data = encode(image, quality)
+    for _ in range(_COMPRESS_MAX_ATTEMPTS):
+        if len(data) <= max_bytes:
+            break
+        shrank = False
+        if has_quality and quality > _COMPRESS_QUALITY_FLOOR:
+            quality = max(_COMPRESS_QUALITY_FLOOR, quality - _COMPRESS_QUALITY_STEP)
+            shrank = True
+        elif min(image.size) > _COMPRESS_MIN_DIMENSION:
+            new_size = tuple(max(_COMPRESS_MIN_DIMENSION, int(n * _COMPRESS_RESIZE_FACTOR))
+                             for n in image.size)
+            image = image.resize(new_size, Image.LANCZOS)
+            quality = 85  # a smaller image can afford to start high again
+            shrank = True
+        if not shrank:
+            break  # out of levers: neither quality nor size can go any lower
+        data = encode(image, quality)
+
+    return data, len(data) <= max_bytes
+
+
 def build_attributes(frontmatter, note_path, author=None, tags=None,
                      extra_attributes=None):
     """Map note frontmatter onto ELOG attributes.
@@ -1543,13 +1663,17 @@ class UploadResult:
     unresolved: list = field(default_factory=list)       # [str] links pointing nowhere
     transliterated: list = field(default_factory=list)   # [(char, replacement)]
     inlined: bool = False                                # did the phase-2 edit run
+    oversized: list = field(default_factory=list)        # [(Path, size)] skipped, too big
+    compressed: list = field(default_factory=list)       # [(Path, orig_size, new_size)]
 
     def summary(self):
         """A one-line human-readable tally."""
         return ('entry {0}: {1} attachment(s), {2} unresolved link(s), '
-                '{3} character(s) transliterated, inline images {4}'.format(
+                '{3} character(s) transliterated, inline images {4}, '
+                '{5} compressed, {6} oversized (skipped)'.format(
                     self.msg_id, len(self.attachments), len(self.unresolved),
-                    len(self.transliterated), 'yes' if self.inlined else 'no'))
+                    len(self.transliterated), 'yes' if self.inlined else 'no',
+                    len(self.compressed), len(self.oversized)))
 
 
 class MarkdownUploader:
@@ -1560,7 +1684,8 @@ class MarkdownUploader:
     """
 
     def __init__(self, logbook, author=None, tags=None, inline_images=True,
-                 input_fn=None, timeout=None, attachment_folders=None):
+                 input_fn=None, timeout=None, attachment_folders=None,
+                 max_attachment_size_mb=None):
         """
         :param logbook: an ``elog.logbook.Logbook``
         :param author: used when the note has no ``author`` frontmatter; prompted if unset
@@ -1574,6 +1699,14 @@ class MarkdownUploader:
                                    directory) to search for a linked attachment when it
                                    is not found beside the note or in ``attachments/``.
                                    See :func:`find_linked_files`.
+        :param max_attachment_size_mb: per-attachment size cap, matching the server's own
+                                       limit (ELOG's default install caps uploads around
+                                       10 MB). An oversized image is re-encoded to fit,
+                                       trading quality and resolution for size (see
+                                       :func:`compress_image_to_limit`); any other
+                                       oversized attachment is skipped with a warning
+                                       rather than sent and rejected by the server.
+                                       ``None`` (the default) applies no cap.
         """
         self.logbook = logbook
         self.author = author
@@ -1582,6 +1715,13 @@ class MarkdownUploader:
         self.input_fn = input_fn
         self.timeout = timeout
         self.attachment_folders = attachment_folders
+        self.max_attachment_size_mb = max_attachment_size_mb
+
+    @property
+    def max_attachment_bytes(self):
+        if self.max_attachment_size_mb is None:
+            return None
+        return int(self.max_attachment_size_mb * 1024 * 1024)
 
     def upload(self, note_path, extra_attributes=None):
         """Post one Markdown note as a new ELOG entry.
@@ -1634,20 +1774,86 @@ class MarkdownUploader:
                     ', '.join(sorted({'{0!r}->{1!r}'.format(a, b) for a, b in replaced}))),
                 stacklevel=2)
 
-        # _prepare_attachments tests isinstance(file_obj, str); a Path raises
-        # LogbookInvalidAttachmentType (logbook.py:663).
-        msg_id = self.logbook.post(html, attributes=attributes,
-                                   attachments=[str(p) for p in files],
-                                   encoding='HTML', timeout=self.timeout)
+        files, upload_paths, oversized, compressed, tmp_dir = self._fit_attachments(files)
+        try:
+            # _prepare_attachments tests isinstance(file_obj, str); a Path raises
+            # LogbookInvalidAttachmentType (logbook.py:663).
+            msg_id = self.logbook.post(html, attributes=attributes,
+                                       attachments=upload_paths,
+                                       encoding='HTML', timeout=self.timeout)
+        finally:
+            # Only after post() returns: requests reads every attachment synchronously
+            # within that call, so the compressed copies must still exist until then.
+            if tmp_dir is not None:
+                tmp_dir.cleanup()
 
         result = UploadResult(msg_id=msg_id, attachments=files, unresolved=unresolved,
-                              transliterated=replaced)
+                              transliterated=replaced, oversized=oversized,
+                              compressed=compressed)
 
         # Past this point the entry exists. Nothing below may raise, or the caller would
         # retry and create a duplicate.
         if self.inline_images and files:
             result.inlined = self._inline_images(msg_id, body, files)
         return result
+
+    def _fit_attachments(self, files):
+        """Apply ``max_attachment_bytes``: compress oversized images, drop the rest.
+
+        Compressed copies keep the original filename (see :func:`compress_image_to_limit`)
+        so later filename-based matching -- ``_inline_images`` below, and ELOG's own
+        rename-on-store -- sees no difference from uploading the original.
+
+        :param files: resolved attachment paths, as returned by :func:`find_linked_files`
+        :return: ``(kept_files, upload_paths, oversized, compressed, tmp_dir)``.
+                 ``kept_files``/``upload_paths`` are parallel and exclude anything
+                 dropped; ``upload_paths`` are the str paths to actually hand to
+                 ``Logbook.post`` (a compressed file's temp path where that applies).
+                 ``oversized`` is ``[(Path, size)]`` for attachments skipped outright.
+                 ``compressed`` is ``[(Path, original_size, final_size)]``.
+                 ``tmp_dir`` is the ``TemporaryDirectory`` holding any compressed copies
+                 -- ``None`` if nothing was compressed -- which the caller must keep
+                 alive until after the attachments have actually been posted.
+        """
+        if self.max_attachment_bytes is None:
+            return list(files), [str(p) for p in files], [], [], None
+
+        kept_files, upload_paths, oversized, compressed = [], [], [], []
+        tmp_dir = None
+
+        for path in files:
+            size = path.stat().st_size
+            if size <= self.max_attachment_bytes:
+                kept_files.append(path)
+                upload_paths.append(str(path))
+                continue
+
+            if not is_compressible_image(path):
+                warnings.warn(
+                    'Attachment {0} is {1} byte(s), over the {2} byte limit; not '
+                    'uploaded (only images are compressed).'.format(
+                        path, size, self.max_attachment_bytes), stacklevel=3)
+                oversized.append((path, size))
+                continue
+
+            data, reached_target = compress_image_to_limit(path, self.max_attachment_bytes)
+            if not reached_target:
+                warnings.warn(
+                    'Attachment {0} is {1} byte(s); compressed to {2} byte(s), still '
+                    'over the {3} byte limit; not uploaded.'.format(
+                        path, size, len(data), self.max_attachment_bytes), stacklevel=3)
+                oversized.append((path, size))
+                continue
+
+            if tmp_dir is None:
+                tmp_dir = tempfile.TemporaryDirectory(prefix='elog_upload_')
+            compressed_path = Path(tmp_dir.name) / path.name
+            compressed_path.write_bytes(data)
+            kept_files.append(path)
+            upload_paths.append(str(compressed_path))
+            compressed.append((path, size, len(data)))
+
+        return kept_files, upload_paths, oversized, compressed, tmp_dir
 
     @staticmethod
     def _sanitize_attributes(attributes):
@@ -1829,17 +2035,20 @@ class LogbookSession:
         if self._uploader is None:
             self._uploader = MarkdownUploader(
                 self.logbook, timeout=self._timeout,
-                attachment_folders=self.config.attachment_folders)
+                attachment_folders=self.config.attachment_folders,
+                max_attachment_size_mb=self.config.max_attachment_size_mb)
         return self._uploader
 
     def upload_markdown(self, note_path, **kwargs):
         """Post one hand-written Markdown note as a new ELOG entry.
 
         See :meth:`MarkdownUploader.upload` for the parameters; uploader options
-        (``author``, ``tags``, ``inline_images``, ``input_fn``, ``attachment_folders``)
-        may be passed here too, overriding the config's ``upload.attachment_folders``.
+        (``author``, ``tags``, ``inline_images``, ``input_fn``, ``attachment_folders``,
+        ``max_attachment_size_mb``) may be passed here too, overriding the config's
+        ``upload.attachment_folders`` / ``upload.max_attachment_size_mb``.
         """
-        for option in ('author', 'tags', 'inline_images', 'input_fn', 'attachment_folders'):
+        for option in ('author', 'tags', 'inline_images', 'input_fn',
+                       'attachment_folders', 'max_attachment_size_mb'):
             if option in kwargs:
                 setattr(self.uploader, option, kwargs.pop(option))
         return self.uploader.upload(note_path, **kwargs)
