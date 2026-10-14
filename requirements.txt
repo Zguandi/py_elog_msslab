@@ -4,3 +4,4 @@ lxml
 PyYAML
 markdownify>=0.13
 markdown>=3.4
+Pillow>=10
