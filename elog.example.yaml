@@ -41,3 +41,9 @@ upload:
   # video) is skipped with a warning instead of being sent and rejected by the server.
   # Default: unset, meaning no cap is applied.
   max_attachment_size_mb: 10
+
+  # Maximum image width in pixels. Any wider image is downscaled (aspect ratio kept)
+  # before upload -- independently of max_attachment_size_mb above, and even if the
+  # image is already under that size cap.
+  # Default: unset, meaning no cap is applied.
+  max_image_width_px: 1920

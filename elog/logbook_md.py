@@ -188,8 +188,26 @@ def _coerce_positive_float(value, key, errors, default=None):
     return number
 
 
+def _coerce_positive_int(value, key, errors, default=None):
+    """Return ``value`` as a positive ``int``. ``None`` becomes ``default``."""
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        errors.append("'{0}' must be a whole number, got {1!r}".format(key, value))
+        return default
+    try:
+        number = int(value)
+    except ValueError:
+        errors.append("'{0}' must be a whole number, got {1!r}".format(key, value))
+        return default
+    if number <= 0:
+        errors.append("'{0}' must be greater than 0, got {1!r}".format(key, value))
+        return default
+    return number
+
+
 #: Recognised keys under the 'upload' mapping.
-_UPLOAD_FIELDS = ('attachment_folders', 'max_attachment_size_mb')
+_UPLOAD_FIELDS = ('attachment_folders', 'max_attachment_size_mb', 'max_image_width_px')
 
 
 def _coerce_upload_section(value, errors, strict):
@@ -197,13 +215,13 @@ def _coerce_upload_section(value, errors, strict):
 
     :param value: ``mapping['upload']``, or ``None`` if the key is absent
     :param strict: unknown sub-keys raise if True, else only warn
-    :return: ``(attachment_folders, max_attachment_size_mb)``
+    :return: ``(attachment_folders, max_attachment_size_mb, max_image_width_px)``
     """
     if value is None:
-        return (), None
+        return (), None, None
     if not isinstance(value, dict):
         errors.append("'upload' must be a mapping, got {0!r}".format(value))
-        return (), None
+        return (), None, None
 
     unknown = sorted(set(value) - set(_UPLOAD_FIELDS))
     if unknown:
@@ -218,7 +236,9 @@ def _coerce_upload_section(value, errors, strict):
         value.get('attachment_folders'), 'upload.attachment_folders', errors)
     max_attachment_size_mb = _coerce_positive_float(
         value.get('max_attachment_size_mb'), 'upload.max_attachment_size_mb', errors)
-    return attachment_folders, max_attachment_size_mb
+    max_image_width_px = _coerce_positive_int(
+        value.get('max_image_width_px'), 'upload.max_image_width_px', errors)
+    return attachment_folders, max_attachment_size_mb, max_image_width_px
 
 
 def _coerce_bool(value, key, errors, default=True):
@@ -311,6 +331,10 @@ class LogbookConfig:
     #: is compressed to fit; any other oversized attachment is skipped. From the YAML
     #: config's ``upload.max_attachment_size_mb``.
     max_attachment_size_mb: float = None
+    #: Maximum image width in pixels. ``None`` means no cap. A wider image is downscaled
+    #: (preserving aspect ratio) before upload, independently of ``max_attachment_size_mb``.
+    #: From the YAML config's ``upload.max_image_width_px``.
+    max_image_width_px: int = None
 
     #: Recognised top-level YAML keys. Anything else is rejected by ``from_mapping``.
     FIELDS = ('hostname', 'logbook', 'port', 'subdir', 'use_ssl', 'upload')
@@ -348,8 +372,8 @@ class LogbookConfig:
         subdir = _coerce_str(mapping.get('subdir'), 'subdir', errors).strip('/')
         hostname = _normalize_hostname(
             _coerce_str(mapping.get('hostname'), 'hostname', errors), use_ssl, errors)
-        attachment_folders, max_attachment_size_mb = _coerce_upload_section(
-            mapping.get('upload'), errors, strict)
+        attachment_folders, max_attachment_size_mb, max_image_width_px = (
+            _coerce_upload_section(mapping.get('upload'), errors, strict))
 
         cls._check_conflicts(hostname, mapping, use_ssl, subdir, port, errors)
 
@@ -360,6 +384,7 @@ class LogbookConfig:
         return cls(hostname=hostname, logbook=logbook, port=port,
                    attachment_folders=attachment_folders,
                    max_attachment_size_mb=max_attachment_size_mb,
+                   max_image_width_px=max_image_width_px,
                    subdir=subdir, use_ssl=use_ssl)
 
     @staticmethod
@@ -1556,21 +1581,42 @@ def is_compressible_image(path):
     return Path(path).suffix.lower() in _COMPRESSIBLE_IMAGE_SUFFIXES
 
 
-def compress_image_to_limit(path, max_bytes):
-    """Re-encode an image until it fits ``max_bytes``, trying quality before size.
+def image_width_exceeds(path, max_width):
+    """True when this image is wider than ``max_width``.
 
-    Alternates two levers: for formats with a quality knob (JPEG, WEBP), lower quality
-    first since it costs nothing visually until it does; once quality bottoms out (or
-    the format has none, e.g. PNG), downscale the resolution and try again. The file
-    keeps its original name and format -- only the bytes change -- so a caller that
-    matches attachments by filename (:class:`MarkdownUploader`'s inline-image rewrite)
-    needs no changes.
+    Cheap: ``Image.open`` reads only the header, not the pixel data.
+    """
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise LogbookUploadError(
+            'Pillow is required to compress image attachments '
+            '(pip install Pillow).') from e
+
+    with Image.open(path) as image:
+        return image.width > max_width
+
+
+def compress_image_to_limit(path, max_bytes=None, max_width=None):
+    """Re-encode an image to fit ``max_width`` and/or ``max_bytes``.
+
+    ``max_width`` is applied first and unconditionally -- a single downscale to that
+    width, preserving aspect ratio, independent of any size target. Then, if still over
+    ``max_bytes``, alternates two more levers: for formats with a quality knob (JPEG,
+    WEBP), lower quality first since it costs nothing visually until it does; once
+    quality bottoms out (or the format has none, e.g. PNG), downscale further and try
+    again. The file keeps its original name and format throughout -- only the bytes
+    change -- so a caller that matches attachments by filename (:class:`MarkdownUploader`'s
+    inline-image rewrite) needs no changes.
 
     :param path: source image path; never modified
-    :param max_bytes: target size in bytes
+    :param max_bytes: target size in bytes; ``None`` to skip size fitting and only apply
+                      ``max_width``
+    :param max_width: if the image is wider than this, downscale to exactly this width
+                      before anything else runs; ``None`` to skip
     :return: ``(data, reached_target)`` -- the best encoding found, and whether it is
-             actually under ``max_bytes`` (``False`` means this is just the smallest
-             this function could manage)
+             actually under ``max_bytes`` (always ``True`` when ``max_bytes`` is
+             ``None``, since there is then nothing to fail)
     """
     try:
         from PIL import Image
@@ -1591,6 +1637,10 @@ def compress_image_to_limit(path, max_bytes):
         background.paste(image.convert('RGBA'), mask=image.convert('RGBA').split()[-1])
         image = background
 
+    if max_width is not None and image.width > max_width:
+        new_height = max(1, round(image.height * max_width / image.width))
+        image = image.resize((max_width, new_height), Image.LANCZOS)
+
     def encode(candidate, quality):
         buffer = io.BytesIO()
         kwargs = {'optimize': True}
@@ -1601,6 +1651,9 @@ def compress_image_to_limit(path, max_bytes):
 
     quality = 85
     data = encode(image, quality)
+    if max_bytes is None:
+        return data, True
+
     for _ in range(_COMPRESS_MAX_ATTEMPTS):
         if len(data) <= max_bytes:
             break
@@ -1685,7 +1738,7 @@ class MarkdownUploader:
 
     def __init__(self, logbook, author=None, tags=None, inline_images=True,
                  input_fn=None, timeout=None, attachment_folders=None,
-                 max_attachment_size_mb=None):
+                 max_attachment_size_mb=None, max_image_width_px=None):
         """
         :param logbook: an ``elog.logbook.Logbook``
         :param author: used when the note has no ``author`` frontmatter; prompted if unset
@@ -1707,6 +1760,11 @@ class MarkdownUploader:
                                        oversized attachment is skipped with a warning
                                        rather than sent and rejected by the server.
                                        ``None`` (the default) applies no cap.
+        :param max_image_width_px: downscale any image wider than this, preserving
+                                   aspect ratio, before upload -- independent of
+                                   ``max_attachment_size_mb``, and applied even to an
+                                   image that is already under that size cap.
+                                   ``None`` (the default) applies no cap.
         """
         self.logbook = logbook
         self.author = author
@@ -1716,6 +1774,7 @@ class MarkdownUploader:
         self.timeout = timeout
         self.attachment_folders = attachment_folders
         self.max_attachment_size_mb = max_attachment_size_mb
+        self.max_image_width_px = max_image_width_px
 
     @property
     def max_attachment_bytes(self):
@@ -1798,7 +1857,8 @@ class MarkdownUploader:
         return result
 
     def _fit_attachments(self, files):
-        """Apply ``max_attachment_bytes``: compress oversized images, drop the rest.
+        """Apply ``max_attachment_bytes``/``max_image_width_px``: resize and/or compress
+        oversized images, drop everything else that's too big.
 
         Compressed copies keep the original filename (see :func:`compress_image_to_limit`)
         so later filename-based matching -- ``_inline_images`` below, and ELOG's own
@@ -1815,7 +1875,7 @@ class MarkdownUploader:
                  -- ``None`` if nothing was compressed -- which the caller must keep
                  alive until after the attachments have actually been posted.
         """
-        if self.max_attachment_bytes is None:
+        if self.max_attachment_bytes is None and self.max_image_width_px is None:
             return list(files), [str(p) for p in files], [], [], None
 
         kept_files, upload_paths, oversized, compressed = [], [], [], []
@@ -1823,12 +1883,18 @@ class MarkdownUploader:
 
         for path in files:
             size = path.stat().st_size
-            if size <= self.max_attachment_bytes:
+            is_image = is_compressible_image(path)
+            over_size = self.max_attachment_bytes is not None and size > self.max_attachment_bytes
+            over_width = is_image and self.max_image_width_px is not None
+            over_width = over_width and image_width_exceeds(path, self.max_image_width_px)
+
+            if not over_size and not over_width:
                 kept_files.append(path)
                 upload_paths.append(str(path))
                 continue
 
-            if not is_compressible_image(path):
+            if not is_image:
+                # over_width requires is_image, so only over_size reaches here.
                 warnings.warn(
                     'Attachment {0} is {1} byte(s), over the {2} byte limit; not '
                     'uploaded (only images are compressed).'.format(
@@ -1836,7 +1902,9 @@ class MarkdownUploader:
                 oversized.append((path, size))
                 continue
 
-            data, reached_target = compress_image_to_limit(path, self.max_attachment_bytes)
+            data, reached_target = compress_image_to_limit(
+                path, max_bytes=self.max_attachment_bytes,
+                max_width=self.max_image_width_px)
             if not reached_target:
                 warnings.warn(
                     'Attachment {0} is {1} byte(s); compressed to {2} byte(s), still '
@@ -2036,7 +2104,8 @@ class LogbookSession:
             self._uploader = MarkdownUploader(
                 self.logbook, timeout=self._timeout,
                 attachment_folders=self.config.attachment_folders,
-                max_attachment_size_mb=self.config.max_attachment_size_mb)
+                max_attachment_size_mb=self.config.max_attachment_size_mb,
+                max_image_width_px=self.config.max_image_width_px)
         return self._uploader
 
     def upload_markdown(self, note_path, **kwargs):
@@ -2044,11 +2113,13 @@ class LogbookSession:
 
         See :meth:`MarkdownUploader.upload` for the parameters; uploader options
         (``author``, ``tags``, ``inline_images``, ``input_fn``, ``attachment_folders``,
-        ``max_attachment_size_mb``) may be passed here too, overriding the config's
-        ``upload.attachment_folders`` / ``upload.max_attachment_size_mb``.
+        ``max_attachment_size_mb``, ``max_image_width_px``) may be passed here too,
+        overriding the config's ``upload.attachment_folders`` /
+        ``upload.max_attachment_size_mb`` / ``upload.max_image_width_px``.
         """
         for option in ('author', 'tags', 'inline_images', 'input_fn',
-                       'attachment_folders', 'max_attachment_size_mb'):
+                       'attachment_folders', 'max_attachment_size_mb',
+                       'max_image_width_px'):
             if option in kwargs:
                 setattr(self.uploader, option, kwargs.pop(option))
         return self.uploader.upload(note_path, **kwargs)
